@@ -192,7 +192,8 @@ weighted_composite_full <- function(gjam_n, wild_n, timber_n, w1, w2, w3) {
     wts  <- c(w1, w2, w3)
     ok   <- !is.na(vals)
     n_components[i] <- sum(ok)
-    score[i] <- if (!any(ok)) NA_real_ else sum(vals[ok]*wts[ok]) / sum(wts[ok])
+    wt_sum <- sum(wts[ok])
+    score[i] <- if (!any(ok) || wt_sum == 0) NA_real_ else sum(vals[ok]*wts[ok]) / wt_sum
   }
   list(score = score, n_components = n_components)
 }
@@ -221,26 +222,21 @@ thumbtack_icon <- makeIcon(
   iconWidth=32, iconHeight=50, iconAnchorX=16, iconAnchorY=48
 )
 
-SEARCH_RADIUS_KM <- 50
-IDW_POWER <- 1
-
-get_all_species <- function(lng, lat, radius_km = SEARCH_RADIUS_KM) {
+# Candidate species list = every species present at the single nearest FIA
+# plot. The list only determines which species are scored at this location;
+# their actual BA there is never used in scoring (GJAM/wildlife/timber are
+# all computed independently of current abundance), so no distance weighting
+# or averaging is needed -- the nearest plot is simply the most relevant one.
+get_all_species <- function(lng, lat) {
   d_km <- haversine_km(lng, lat, coords_lon, coords_lat)
-  idxs <- which(d_km <= radius_km)
-  if (length(idxs) == 0) {
-    idxs <- which.min(d_km)
-  }
-  w <- 1 / (d_km[idxs]^IDW_POWER)
-  w[!is.finite(w)] <- max(w[is.finite(w)], na.rm = TRUE) * 1e6
-  w <- w / sum(w)
+  idx  <- which.min(d_km)
   
-  sub_mat <- BA_mat[idxs, , drop = FALSE]
-  sub_mat[is.na(sub_mat)] <- 0
-  ba_agg <- as.numeric(w %*% sub_mat)
-  names(ba_agg) <- colnames(sub_mat)
+  ba_row <- BA_mat[idx, ]
+  ba_row[is.na(ba_row)] <- 0
+  present <- names(ba_row)[ba_row > 0]
   
-  data.frame(key=names(ba_agg), display_name=species_display[names(ba_agg)],
-             ba=ba_agg, stringsAsFactors=FALSE)
+  data.frame(key = present, display_name = species_display[present],
+             stringsAsFactors = FALSE)
 }
 
 # Returns a list with $values (named numeric vector) and $fallback_keys
@@ -455,22 +451,16 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .map-popup-title { font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--pb-sage); }
 .map-popup-body { flex: 1; position: relative; overflow: hidden; }
 
-.riparian-toggle-group {
+.riparian-group {
   background: rgba(0,0,0,0.25);
   border: 1px solid rgba(0,0,0,0.3);
-  padding: 10px 12px; margin-bottom: 4px;
-  display: flex; align-items: flex-start; gap: 8px;
+  padding: 10px 12px 8px; margin-bottom: 10px;
 }
-.riparian-toggle-group input[type='checkbox'] {
-  margin-top: 2px; accent-color: var(--pb-riparian); cursor: pointer;
-}
-.riparian-toggle-label {
-  font-family: var(--font-body); font-size: 11px; font-weight: 700;
-  color: var(--pb-mist); cursor: pointer; display: block;
-}
+.riparian-group .irs--shiny .irs-bar { background: var(--pb-riparian); }
+.riparian-group .irs--shiny .irs-handle { background: var(--pb-mist); border-color: var(--pb-riparian); }
 .riparian-toggle-note {
   font-family: var(--font-body); font-size: 9px; color: var(--pb-sage);
-  margin-top: 2px; line-height: 1.3; display: block;
+  margin-top: 4px; line-height: 1.3; display: block;
 }
 .flag-tag {
   display: inline-block;
@@ -712,22 +702,58 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .riparian-info .ripar-no { color: var(--pb-ink-muted); font-style: italic; }
 
 .about-outer { height: calc(100vh - 110px); background: var(--pb-parchment); overflow-y: auto; }
-.about-inner { max-width: 900px; margin: 0 auto; padding: 48px 32px 64px; }
+.about-inner { max-width: 980px; margin: 0 auto; padding: 0 0 64px; }
+
+.about-hero {
+  background: var(--pb-forest);
+  padding: 44px 32px; text-align: center;
+  border-bottom: 2px solid #0E1F18;
+}
 .about-heading {
   font-family: var(--font-display); font-size: 32px; font-weight: 700;
-  color: var(--pb-forest); margin: 0 0 8px 0; text-align: center;
+  color: #E8F5EC; margin: 0 0 8px 0;
 }
 .about-subheading {
-  font-family: var(--font-body); font-size: 13px; color: var(--pb-ink-muted);
-  text-align: center; margin: 0 0 40px 0; line-height: 1.6;
+  font-family: var(--font-body); font-size: 13px; color: var(--pb-mist);
+  margin: 0 auto; max-width: 600px; line-height: 1.6;
 }
-.about-team-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+
+.about-section { padding: 32px 32px 0; }
+.about-section-label {
+  font-family: var(--font-display); font-size: 10px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--pb-understory);
+  margin: 0 0 14px 0; display: block;
+}
+
+.about-stat-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 32px; }
+.about-stat-tile {
+  background: white; border: 1px solid var(--pb-pine-line);
+  border-top: 3px solid var(--pb-pine-line);
+  padding: 14px 16px;
+}
+.about-stat-tile.gjam-tile  { border-top-color: var(--pb-gjam); }
+.about-stat-tile.wild-tile  { border-top-color: var(--pb-wildlife); }
+.about-stat-tile.timb-tile  { border-top-color: var(--pb-timber); }
+.about-stat-val {
+  font-family: var(--font-body); font-size: 20px; font-weight: 700; color: var(--pb-ink); line-height: 1;
+}
+.about-stat-label {
+  font-family: var(--font-display); font-size: 9px; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--pb-ink-muted);
+  margin-top: 4px; display: block;
+}
+
+.about-team-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; padding-bottom: 8px; }
 .about-card {
   background: white; border: 1px solid var(--pb-pine-line);
+  border-top: 3px solid var(--pb-pine-line);
   padding: 20px 18px; text-align: center;
 }
+.about-card.card-a { border-top-color: var(--pb-gjam); }
+.about-card.card-b { border-top-color: var(--pb-wildlife); }
+.about-card.card-c { border-top-color: var(--pb-timber); }
 .about-photo {
-  width: 120px; height: 120px; border-radius: 50%;
+  width: 110px; height: 110px; border-radius: 50%;
   object-fit: cover; margin: 0 auto 14px;
   border: 3px solid var(--pb-linen); display: block;
 }
@@ -765,13 +791,38 @@ score_color_css <- function(norm_val, type="composite") {
   return("#8AC888")
 }
 
-RIPARIAN_BOOST <- 0.12
+TIE_TOLERANCE <- 0.05
 
-apply_riparian_boost <- function(score, ba_codes, riparian_on) {
-  if (!isTRUE(riparian_on)) return(score)
-  is_riparian <- wildlife_data$riparian_recommended[match(ba_codes, wildlife_data$ba_code)]
+# riparian_mode: 0 = disregard, 1 = tie-breaker, 2 = required.
+# Mode 0 returns scores and keys unchanged.
+# Mode 1 keeps every species but re-sorts so that within any cluster of
+#   near-tied scores (all within TIE_TOLERANCE of each other), riparian-
+#   recommended species come first. Scores themselves are never altered --
+#   only the sort order changes, so the displayed score is always real.
+# Mode 2 drops every non-riparian species from the candidate list before
+#   scoring, so only riparian-recommended species ever appear.
+apply_riparian_mode <- function(df, riparian_mode) {
+  if (is.null(riparian_mode) || riparian_mode == 0) return(df)
+  
+  is_riparian <- wildlife_data$riparian_recommended[match(df$key, wildlife_data$ba_code)]
   is_riparian <- ifelse(is.na(is_riparian), FALSE, is_riparian)
-  ifelse(is_riparian, pmin(score + RIPARIAN_BOOST, 1), score)
+  df$is_riparian <- is_riparian
+  
+  if (riparian_mode == 2) {
+    return(df[is_riparian, , drop = FALSE])
+  }
+  
+  ord <- order(-df$score, !df$is_riparian, na.last = TRUE)
+  df  <- df[ord, , drop = FALSE]
+  if (nrow(df) > 1 && !is.na(df$score[1])) {
+    near_top <- which(df$score >= df$score[1] - TIE_TOLERANCE)
+    if (length(near_top) > 1) {
+      tied_block <- df[near_top, , drop = FALSE]
+      tied_block <- tied_block[order(!tied_block$is_riparian), , drop = FALSE]
+      df[near_top, ] <- tied_block
+    }
+  }
+  df
 }
 
 ui <- fluidPage(
@@ -797,6 +848,16 @@ $(document).on('input', '#gjam_search', function() {
     $(this).toggle(name.indexOf(q) >= 0);
   });
 });
+var riparianLabels = ['Disregard', 'Tie-breaker', 'Required'];
+function relabelRiparianSlider() {
+  $('#riparian_mode').closest('.riparian-group').find('.irs-single, .irs-from, .irs-to').each(function() {
+    var v = parseInt($(this).text(), 10);
+    if (!isNaN(v) && riparianLabels[v] !== undefined) $(this).text(riparianLabels[v]);
+  });
+}
+$(document).on('shiny:value', function() { setTimeout(relabelRiparianSlider, 50); });
+$(document).on('input change', '#riparian_mode', function() { setTimeout(relabelRiparianSlider, 10); });
+$(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
     "))
   ),
   
@@ -830,26 +891,25 @@ $(document).on('input', '#gjam_search', function() {
                                tags$span(class="sidebar-section-label", "Model Weights"),
                                div(class="weight-group",
                                    div(class="weight-label", "GJAM Climate Score"),
-                                   sliderInput("w1", NULL, min=0, max=1, value=0, step=0.01, ticks=FALSE, width="100%"),
+                                   sliderInput("w1", NULL, min=0, max=1, value=0.34, step=0.01, ticks=FALSE, width="100%"),
                                    div(class="weight-note", "Predicted BA in plots across US by given timeframe")
                                ),
                                div(class="weight-group",
                                    div(class="weight-label", "Wildlife Value"),
-                                   sliderInput("w2", NULL, min=0, max=1, value=0, step=0.01, ticks=FALSE, width="100%"),
+                                   sliderInput("w2", NULL, min=0, max=1, value=0.33, step=0.01, ticks=FALSE, width="100%"),
                                    div(class="weight-note", "Combined scores from fruit, insects, pollinators, and deer")
                                ),
                                div(class="weight-group",
                                    div(class="weight-label", "Timber Market Value"),
-                                   sliderInput("w3", NULL, min=0, max=1, value=0, step=0.01, ticks=FALSE, width="100%"),
+                                   sliderInput("w3", NULL, min=0, max=1, value=0.33, step=0.01, ticks=FALSE, width="100%"),
                                    div(class="weight-note", "Regional price based on official 2025 timber sales directly with USFS.")
                                ),
-                               div(class="riparian-toggle-group",
-                                   tags$input(type="checkbox", id="riparian_priority"),
-                                   tags$label(`for`="riparian_priority",
-                                              tags$span(class="riparian-toggle-label", "Prioritize riparian species"),
-                                              tags$span(class="riparian-toggle-note",
-                                                        "Favors species recommended for streambank and wetland-edge planting.")
-                                   )
+                               div(class="riparian-group",
+                                   div(class="weight-label", "Riparian Status"),
+                                   sliderInput("riparian_mode", NULL, min=0, max=2, value=0, step=1,
+                                               ticks=TRUE, width="100%",
+                                               animate=FALSE),
+                                   uiOutput("riparian_mode_note")
                                ),
                                tags$hr(style="border-color:rgba(255,255,255,0.1); margin: 14px 0;"),
                                tags$span(class="sidebar-section-label", "Climate Period"),
@@ -971,42 +1031,64 @@ $(document).on('input', '#gjam_search', function() {
               
               tabPanel("About",
                        div(class="about-outer",
-                           div(class="about-inner",
+                           div(class="about-hero",
                                div(class="about-heading", "About PBGJAM"),
                                div(class="about-subheading",
                                    "PBGJAM v2 was developed by Tate Commission, Dr. Tong Qiu, and ",
                                    "Dr. James Clark from Duke University."
+                               )
+                           ),
+                           div(class="about-inner",
+                               div(class="about-section",
+                                   tags$span(class="about-section-label", "What the model scores"),
+                                   div(class="about-stat-row",
+                                       div(class="about-stat-tile gjam-tile",
+                                           div(class="about-stat-val", "GJAM"),
+                                           div(class="about-stat-label", "Predicted climate suitability")
+                                       ),
+                                       div(class="about-stat-tile wild-tile",
+                                           div(class="about-stat-val", "Wildlife"),
+                                           div(class="about-stat-label", "Fruit, insects, pollinators, deer")
+                                       ),
+                                       div(class="about-stat-tile timb-tile",
+                                           div(class="about-stat-val", "Timber"),
+                                           div(class="about-stat-label", "Regional USFS market value")
+                                       )
+                                   )
                                ),
-                               div(class="about-team-grid",
-                                   div(class="about-card",
-                                       tags$img(class="about-photo", src="tatecommission.png", alt="Tate Commission"),
-                                       div(class="about-name", "Tate Commission"),
-                                       div(class="about-role", "Lead Developer"),
-                                       div(class="about-bio",
-                                           "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod ",
-                                           "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim ",
-                                           "veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea ",
-                                           "commodo consequat."
-                                       )
-                                   ),
-                                   div(class="about-card",
-                                       tags$img(class="about-photo", src="tongqiu.png", alt="Dr. Tong Qiu"),
-                                       div(class="about-name", "Dr. Tong Qiu"),
-                                       div(class="about-role", "Faculty Advisor"),
-                                       div(class="about-bio",
-                                           "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum ",
-                                           "dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non ",
-                                           "proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
-                                       )
-                                   ),
-                                   div(class="about-card",
-                                       tags$img(class="about-photo", src="jamesclark.png", alt="Dr. James Clark"),
-                                       div(class="about-name", "Dr. James Clark"),
-                                       div(class="about-role", "Faculty Advisor"),
-                                       div(class="about-bio",
-                                           "Sed ut perspiciatis unde omnis iste natus error sit voluptatem ",
-                                           "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ",
-                                           "ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt."
+                               div(class="about-section",
+                                   tags$span(class="about-section-label", "Team"),
+                                   div(class="about-team-grid",
+                                       div(class="about-card card-a",
+                                           tags$img(class="about-photo", src="tatecommission.png", alt="Tate Commission"),
+                                           div(class="about-name", "Tate Commission"),
+                                           div(class="about-role", "Lead Developer"),
+                                           div(class="about-bio",
+                                               "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod ",
+                                               "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim ",
+                                               "veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea ",
+                                               "commodo consequat."
+                                           )
+                                       ),
+                                       div(class="about-card card-b",
+                                           tags$img(class="about-photo", src="tongqiu.png", alt="Dr. Tong Qiu"),
+                                           div(class="about-name", "Dr. Tong Qiu"),
+                                           div(class="about-role", "Faculty Advisor"),
+                                           div(class="about-bio",
+                                               "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum ",
+                                               "dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non ",
+                                               "proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+                                           )
+                                       ),
+                                       div(class="about-card card-c",
+                                           tags$img(class="about-photo", src="jamesclark.png", alt="Dr. James Clark"),
+                                           div(class="about-name", "Dr. James Clark"),
+                                           div(class="about-role", "Faculty Advisor"),
+                                           div(class="about-bio",
+                                               "Sed ut perspiciatis unde omnis iste natus error sit voluptatem ",
+                                               "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ",
+                                               "ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt."
+                                           )
                                        )
                                    )
                                )
@@ -1032,6 +1114,17 @@ server <- function(input, output, session) {
     rv$time_range <- input$time_range
   })
   
+  output$riparian_mode_note <- renderUI({
+    mode <- if (is.null(input$riparian_mode)) 0 else input$riparian_mode
+    txt <- switch(as.character(mode),
+                  "0" = "Disregard riparian status entirely.",
+                  "1" = "Use as a tie-breaker among near-equal scores.",
+                  "2" = "Only show species recommended for riparian planting.",
+                  "Disregard riparian status entirely."
+    )
+    tags$span(class="riparian-toggle-note", txt)
+  })
+  
   composite_scores <- reactive({
     if (is.null(rv$click_lng)) return(NULL)
     all_sp <- tryCatch(get_all_species(rv$click_lng, rv$click_lat), error=function(e) NULL)
@@ -1051,22 +1144,21 @@ server <- function(input, output, session) {
     
     composite <- weighted_composite_full(gjam_n, wild_n, timber_n, input$w1, input$w2, input$w3)
     
-    final_score <- apply_riparian_boost(composite$score, keys, input$riparian_priority)
-    
     df <- data.frame(
       key            = keys,
       display_name   = all_sp$display_name,
       gjam           = round(gjam_n, 4),
       wildlife       = round(wild_n, 4),
       timber         = round(timber_n, 4),
-      score          = round(final_score, 4),
+      score          = round(composite$score, 4),
       n_components   = composite$n_components,
       timber_raw     = round(timber_prices, 2),
       wildlife_raw   = round(wild_raw, 1),
       gjam_is_genus_avg = keys %in% gjam_fallback_keys,
       stringsAsFactors = FALSE
     )
-    df[order(df$score, decreasing=TRUE, na.last=TRUE), ]
+    df <- df[order(df$score, decreasing=TRUE, na.last=TRUE), ]
+    apply_riparian_mode(df, input$riparian_mode)
   })
   
   top10_scored <- reactive({
@@ -1282,10 +1374,11 @@ server <- function(input, output, session) {
       wd  <- wildlife_data[wildlife_data$ba_code == row$key, ]
       pest_flag     <- nrow(wd) > 0 && isTRUE(wd$has_pest_flag[1])
       riparian_flag <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
+      riparian_mode_on <- !is.null(input$riparian_mode) && input$riparian_mode > 0
       div(class=cls, `data-key`=row$key,
           div(class="dm-sp-rank", i),
           div(class="dm-sp-name", row$display_name,
-              if (isTRUE(input$riparian_priority) && riparian_flag)
+              if (riparian_mode_on && riparian_flag)
                 tags$span(class="flag-tag flag-riparian", "RP") else NULL,
               if (pest_flag) tags$span(class="flag-tag flag-pest", "PEST") else NULL),
           div(class="dm-sp-score", sprintf("%.3f", row$score))
@@ -1322,11 +1415,17 @@ server <- function(input, output, session) {
     row <- df[df$key == key, ]
     if (nrow(row)==0) return(NULL)
     fmt <- function(x) if (is.na(x)) "-" else sprintf("%.3f", x)
-    riparian_note <- if (isTRUE(input$riparian_priority)) {
+    mode <- if (is.null(input$riparian_mode)) 0 else input$riparian_mode
+    riparian_note <- if (mode > 0) {
       wd <- wildlife_data[wildlife_data$ba_code == key, ]
-      if (nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1]))
-        paste0("+", RIPARIAN_BOOST, " riparian boost applied")
-      else "no riparian boost (not recommended)"
+      is_rip <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
+      if (mode == 2) {
+        "riparian-required mode: only recommended species shown"
+      } else if (is_rip) {
+        "riparian species: favored among near-tied scores"
+      } else {
+        "not riparian-recommended"
+      }
     } else NULL
     div(class="dm-metric-row",
         div(class="dm-metric-card gjam-card",
