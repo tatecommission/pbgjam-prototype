@@ -1,0 +1,11 @@
+.DS_Store
+.Rapp.history
+*.rdata
+*.RData
+*.tif
+*.gpkg
+rsconnect/
+*.jpg
+*.png
+www/*.jpg
+www/*.png
