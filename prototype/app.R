@@ -10,23 +10,6 @@ library(tidyverse)
 load("BA.rdata")
 load("xdata.rdata")
 
-# -- Wildlife CSV --------------------------------------------------------------
-# NOTE on has_pest_flag: only Quercus macrocarpa was showing a pest alert in
-# testing. The app applies no species-specific filtering of this column, so
-# the cause is in the source CSV, not app logic. The most likely explanations:
-#   1. The column is genuinely sparse (only that row was ever populated by
-#      whoever compiled the trait data), in which case the absence of flags
-#      for other oaks reflects incomplete data entry, not a real absence of
-#      pest risk (e.g. Quercus rubra, Q. alba, Q. velutina all have known
-#      pest/pathogen issues such as oak wilt, gypsy moth, etc. in real life).
-#   2. The column has inconsistent representations across rows ("TRUE"/"FALSE",
-#      "Yes"/"No", 1/0, blank) and as.logical() silently coerces anything it
-#      doesn't recognize to NA rather than FALSE, which would make rows look
-#      unflagged when they were actually just encoded differently.
-# Recommend manually inspecting the has_pest_flag column for all Quercus rows
-# in BA_wildlife_traits.csv. The check below is widened to catch common
-# truthy string encodings in case option 2 is the cause, but it cannot recover
-# data that was never entered (option 1).
 wildlife_data <- read_csv(
   "~/Documents/PBGJAM-data-explorer/raw_data/v2/BA_wildlife_traits.csv",
   show_col_types = FALSE
@@ -38,7 +21,8 @@ wildlife_data <- read_csv(
     lep_spp_supported,
     berry_nut_seed_product, fruit_seed_abundance, fruit_seed_persistence,
     palatable_browse_animal, bloom_period,
-    has_pest_flag, max_pest_severity, pest_flag_list, pest_flag_notes
+    has_pest_flag, max_pest_severity, pest_flag_list, pest_flag_notes,
+    wetland_wettest, wetland_modal, riparian_category, riparian_recommended
   ) |>
   mutate(
     wildlife_value_index = as.numeric(wildlife_value_index),
@@ -52,6 +36,12 @@ wildlife_data <- read_csv(
       toupper(trimws(as.character(has_pest_flag_raw))) %in%
         c("TRUE","T","YES","Y","1") ~ TRUE,
       TRUE ~ as.logical(has_pest_flag_raw)
+    ),
+    riparian_recommended = case_when(
+      is.na(riparian_recommended) ~ FALSE,
+      toupper(trimws(as.character(riparian_recommended))) %in%
+        c("TRUE","T","YES","Y","1") ~ TRUE,
+      TRUE ~ as.logical(riparian_recommended)
     )
   ) |>
   select(-has_pest_flag_raw)
@@ -79,7 +69,6 @@ fmt_species <- function(nm) {
 species_names   <- colnames(BA_mat)
 species_display <- setNames(sapply(species_names, fmt_species, USE.NAMES=FALSE), species_names)
 
-# -- GJAM raster lookup -------------------------------------------------------
 .gjam_base <- path.expand(
   "~/Documents/PBGJAM-data-explorer/data4Tate/gjamCreateMap/Trees/PredRasScale/rcp45"
 )
@@ -93,12 +82,6 @@ gjam_files <- lapply(
   }
 )
 
-# -- Haversine distance (km) --------------------------------------------------
-# Replaces raw degree-distance (lon^2 + lat^2) used previously, which is
-# geodesically wrong: 1 degree of longitude is shorter than 1 degree of
-# latitude everywhere except the equator, so degree-distance systematically
-# distorts east-west vs north-south comparisons. Haversine accounts for the
-# Earth's curvature and returns true great-circle distance in kilometers.
 haversine_km <- function(lon1, lat1, lon2, lat2) {
   R <- 6371
   to_rad <- pi / 180
@@ -108,7 +91,6 @@ haversine_km <- function(lon1, lat1, lon2, lat2) {
   2 * R * asin(pmin(1, sqrt(a)))
 }
 
-# -- USFS regions -------------------------------------------------------------
 .usfs_centroids <- data.frame(
   region = c("R1","R2","R3","R4","R5","R6","R8","R9","R10"),
   lon    = c(-113.5,-105.5,-108.5,-113.0,-119.5,-121.5,-89.0,-84.0,-153.0),
@@ -144,14 +126,6 @@ get_usfs_region <- function(lng, lat) {
   region_col
 }
 
-# Timber price lookup.
-# Previous version averaged the 3 nearest region centroids (using flawed
-# degree distance) whenever the exact region had no price, which manufactures
-# a number from increasingly distant, less relevant markets and hides the
-# fact that data is missing. The simpler and more scientific approach: fall
-# back to the single true nearest region by haversine distance, and otherwise
-# return NA rather than blending several distant regions together. NA is then
-# handled transparently downstream instead of being papered over here.
 get_timber_price <- function(lng, lat, species_key) {
   row <- timber[timber$gjam_species == species_key, ]
   if (nrow(row) == 0) return(NA_real_)
@@ -172,7 +146,6 @@ get_timber_price <- function(lng, lat, species_key) {
   NA_real_
 }
 
-# -- Raster stack + normalization ---------------------------------------------
 message("Building GJAM raster stacks...")
 .gjam_stack <- lapply(c("2040_2069","2070_2099"), function(period) {
   tifs <- unname(gjam_files[[period]])
@@ -189,12 +162,9 @@ names(.gjam_stack) <- c("2040_2069","2070_2099")
 message("  2040-2069: ", terra::nlyr(.gjam_stack[["2040_2069"]]), " layers")
 message("  2070-2099: ", terra::nlyr(.gjam_stack[["2070_2099"]]), " layers")
 
-# NOTE: Global range estimated from 10 sampled layers — may not reflect true
-# min/max of all species. Consider sampling more layers or using all of them.
 gjam_range <- local({
-  s   <- .gjam_stack[["2040_2069"]]
-  idx <- round(seq(1, terra::nlyr(s), length.out = min(10, terra::nlyr(s))))
-  vals <- unlist(lapply(idx, function(i) {
+  s    <- .gjam_stack[["2040_2069"]]
+  vals <- unlist(lapply(seq_len(terra::nlyr(s)), function(i) {
     v <- terra::values(s[[i]], na.rm=TRUE); v[is.finite(v)]
   }))
   c(min(vals), max(vals))
@@ -213,17 +183,6 @@ norm_global <- function(x, rng) {
   pmin(pmax((x-rng[1])/(rng[2]-rng[1]),0),1)
 }
 
-# Previous approach: when a component is NA (most often timber), weights are
-# silently re-proportioned across the remaining components, so a species
-# missing timber data is scored only on GJAM + wildlife with no signal to the
-# user that the score is based on incomplete information.
-#
-# Simpler and more scientific approach: keep partial scoring (discarding any
-# row missing a component would throw out too much real data for an
-# exploratory tool), but make incompleteness visible rather than hidden.
-# weighted_composite_full returns both the score and the number of
-# components actually used, so the UI can flag partial scores explicitly
-# (see dm_metric_cards, which shows "2 of 3 components" when n_components < 3).
 weighted_composite_full <- function(gjam_n, wild_n, timber_n, w1, w2, w3) {
   n <- length(gjam_n)
   score <- numeric(n)
@@ -238,13 +197,11 @@ weighted_composite_full <- function(gjam_n, wild_n, timber_n, w1, w2, w3) {
   list(score = score, n_components = n_components)
 }
 
-# -- State boundaries ---------------------------------------------------------
 options(tigris_use_cache=TRUE)
 state_sf <- tigris::states(cb=TRUE, resolution="500k", progress_bar=FALSE)
 state_sf <- state_sf[!state_sf$STUSPS %in% c("AK","HI","PR","VI","GU","MP","AS","DC"),]
 state_sf <- sf::st_transform(state_sf, 4326)
 
-# -- Thumbtack icon -----------------------------------------------------------
 .pin_svg <- paste0(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 50">',
   '<defs>',
@@ -264,22 +221,6 @@ thumbtack_icon <- makeIcon(
   iconWidth=32, iconHeight=50, iconAnchorX=16, iconAnchorY=48
 )
 
-# -- Spatial helpers ----------------------------------------------------------
-# Previous approach: find the 5 nearest FIA plots by raw degree-distance and
-# SUM their basal area per species, with every plot weighted equally
-# regardless of whether it sits 2 km or 200 km from the click point. This has
-# two problems: (1) summing instead of averaging means denser FIA sampling
-# regions produce inflated BA values that have nothing to do with actual
-# forest composition, and (2) a fixed k=5 with no distance cap means "nearest
-# 5" can mean very different things in sparse vs dense regions.
-#
-# Simpler and more scientific approach: inverse-distance weighted (IDW)
-# averaging of all FIA plots within a fixed search radius, using true
-# haversine distance. IDW is a standard, well-documented spatial
-# interpolation method. Weighting by 1/distance (rather than summing
-# unweighted) means nearby plots count more than far ones, and averaging
-# (rather than summing) removes the plot-density artifact. A fixed radius
-# also means the estimate has a consistent geographic meaning everywhere.
 SEARCH_RADIUS_KM <- 50
 IDW_POWER <- 1
 
@@ -287,13 +228,10 @@ get_all_species <- function(lng, lat, radius_km = SEARCH_RADIUS_KM) {
   d_km <- haversine_km(lng, lat, coords_lon, coords_lat)
   idxs <- which(d_km <= radius_km)
   if (length(idxs) == 0) {
-    # No plots within radius: fall back to the single nearest plot so the
-    # tool still returns a result, clearly based on one point rather than
-    # an interpolated neighborhood.
     idxs <- which.min(d_km)
   }
   w <- 1 / (d_km[idxs]^IDW_POWER)
-  w[!is.finite(w)] <- max(w[is.finite(w)], na.rm = TRUE) * 1e6  # exact-match plot
+  w[!is.finite(w)] <- max(w[is.finite(w)], na.rm = TRUE) * 1e6
   w <- w / sum(w)
   
   sub_mat <- BA_mat[idxs, , drop = FALSE]
@@ -305,9 +243,14 @@ get_all_species <- function(lng, lat, radius_km = SEARCH_RADIUS_KM) {
              ba=ba_agg, stringsAsFactors=FALSE)
 }
 
+# Returns a list with $values (named numeric vector) and $fallback_keys
+# (character vector of species whose value came from a genus average rather
+# than their own raster, so the UI can flag imprecise scores instead of
+# presenting them as equally precise to direct matches).
 get_gjam_vals <- function(lng, lat, keys, period) {
   stack <- .gjam_stack[[period]]
-  if (is.null(stack)) return(setNames(rep(NA_real_, length(keys)), keys))
+  if (is.null(stack))
+    return(list(values=setNames(rep(NA_real_, length(keys)), keys), fallback_keys=character(0)))
   pt       <- terra::vect(matrix(c(lng, lat), ncol=2), crs="EPSG:4326")
   extracted <- tryCatch(
     as.numeric(terra::extract(stack, pt)[1, -1]),
@@ -315,17 +258,17 @@ get_gjam_vals <- function(lng, lat, keys, period) {
   )
   names(extracted) <- names(stack)
   all_keys <- names(stack)
-  sapply(keys, function(k) {
+  fallback_keys <- character(0)
+  values <- sapply(keys, function(k) {
     if (k %in% all_keys && is.finite(extracted[[k]])) return(extracted[[k]])
-    # Genus-level fallback: average of all species sharing the same genus prefix.
-    # CAUTION: congeners can have very different climate niches. This fallback
-    # is imprecise and is flagged in the UI when it fires.
     genus_lower <- tolower(regmatches(k, regexpr("^[a-z]+", k)))
     genus_keys  <- all_keys[startsWith(tolower(all_keys), genus_lower)]
     gv <- extracted[genus_keys]
     gv <- gv[is.finite(gv)]
+    if (length(gv) > 0) fallback_keys <<- c(fallback_keys, k)
     if (length(gv) == 0) NA_real_ else mean(gv)
   })
+  list(values=values, fallback_keys=fallback_keys)
 }
 
 safe_vals <- function(r) { v <- raster::values(r); v[!is.na(v)&is.finite(v)] }
@@ -337,21 +280,14 @@ load_display_raster <- function(fpath, agg_fact=1) {
   raster::raster(r)
 }
 
-# Loads GJAM display raster for a given species key + period.
-# Falls back to genus average raster if exact species not found.
-# Returns NULL if nothing found.
 load_gjam_raster_for_key <- function(key, period, agg_fact=3) {
   files <- gjam_files[[period]]
-  # Direct match
   if (key %in% names(files) && file.exists(files[[key]]))
     return(list(raster=load_display_raster(files[[key]], agg_fact), fallback=FALSE))
-  # Genus fallback: load and AVERAGE all matching species rasters
   genus_lower <- tolower(regmatches(key, regexpr("^[a-z]+", key)))
   genus_keys  <- names(files)[startsWith(tolower(names(files)), genus_lower)]
   genus_keys  <- genus_keys[sapply(genus_keys, function(gk) file.exists(files[[gk]]))]
   if (length(genus_keys) == 0) return(list(raster=NULL, fallback=TRUE))
-  # Average the genus rasters (terra multi-layer mean — more correct than
-  # returning the first match, which was the old behavior)
   tryCatch({
     stack_r <- terra::rast(lapply(genus_keys, function(gk) terra::rast(files[[gk]])))
     r_mean  <- terra::app(stack_r, fun="mean", na.rm=TRUE)
@@ -360,32 +296,10 @@ load_gjam_raster_for_key <- function(key, period, agg_fact=3) {
   }, error=function(e) list(raster=NULL, fallback=TRUE))
 }
 
-# All species that have a GJAM raster in at least one period
 all_gjam_keys <- unique(c(names(gjam_files[["2040_2069"]]), names(gjam_files[["2070_2099"]])))
 all_gjam_display <- sort(species_display[intersect(all_gjam_keys, names(species_display))])
 
-# ============================================================
-# STYLE GUIDE — PBGJAM v2
-# Typefaces : Display/UI labels — "Gill Sans", "Gill Sans MT", Calibri (fallback)
-#             Body / data — Arial, Helvetica Neue, sans-serif
-# Color palette:
-#   --pb-forest    : #1C3A28   (deep forest green — primary dark surface)
-#   --pb-canopy    : #2A4F38   (mid canopy — secondary dark surface)
-#   --pb-understory: #3D6B50   (understory — interactive elements)
-#   --pb-sage      : #7DB89A   (sage green — labels on dark)
-#   --pb-mist      : #C8DDD4   (mist — body text on dark)
-#   --pb-parchment : #F4F7F5   (parchment — light surface / page bg)
-#   --pb-linen     : #E8EEE9   (linen — card bg on light)
-#   --pb-pine-line : #B4C8BC   (pine line — borders on light)
-#   --pb-accent    : #3A8A5A   (accent green — data bars, scores)
-#   --pb-accent-hi : #2E7D4A   (accent darker — totals, selected values)
-#   --pb-timber    : #D9A300   (yellow, timber score indicator)
-#   --pb-wildlife  : #D43B3B   (red, wildlife score indicator)
-#   --pb-gjam      : #1F6FCC   (blue, GJAM raster and climate score indicator)
-#   --pb-danger    : #8B1A1A   (pest / pathogen alert)
-#   --pb-ink       : #1A2E24   (near-black ink — body text on light)
-#   --pb-ink-muted : #5A7A68   (muted ink — secondary text on light)
-# ============================================================
+# STYLE GUIDE - PBGJAM v2
 
 app_css <- "
 :root {
@@ -403,6 +317,7 @@ app_css <- "
   --pb-wildlife:   #D43B3B;
   --pb-gjam:       #1F6FCC;
   --pb-danger:     #8B1A1A;
+  --pb-riparian:   #2E8FA3;
   --pb-ink:        #1A2E24;
   --pb-ink-muted:  #5A7A68;
   --font-display: 'Gill Sans', 'Gill Sans MT', Calibri, Arial, sans-serif;
@@ -412,7 +327,6 @@ app_css <- "
 * { box-sizing: border-box; }
 body { font-family: var(--font-body); background: var(--pb-forest); color: var(--pb-ink); margin: 0; padding: 0; }
 
-/* ── Header ─────────────────────────────────────────────── */
 .app-header {
   background: var(--pb-forest);
   padding: 10px 24px;
@@ -424,7 +338,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .header-sponsors img { height: 28px; opacity: 0.85; filter: brightness(0) invert(1); }
 .header-sponsors .nasa-logo { height: 44px; }
 
-/* ── Nav tabs ────────────────────────────────────────────── */
 .nav-tabs {
   background: var(--pb-canopy) !important;
   border-bottom: 2px solid #0C1C16 !important;
@@ -451,7 +364,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 }
 .tab-content { padding: 0; }
 
-/* ── Welcome tab ─────────────────────────────────────────── */
 .welcome-tab {
   height: calc(100vh - 110px);
   background-image: url('forest-background.jpg');
@@ -478,7 +390,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
   text-shadow: 0 1px 5px rgba(0,0,0,0.75);
 }
 
-/* ── Map / Decision Making tab ───────────────────────────── */
 .tab1-layout { display: flex; height: calc(100vh - 110px); }
 .sidebar-col {
   width: 260px; min-width: 260px;
@@ -544,10 +455,35 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .map-popup-title { font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--pb-sage); }
 .map-popup-body { flex: 1; position: relative; overflow: hidden; }
 
-/* ── GJAM tab ────────────────────────────────────────────── */
+.riparian-toggle-group {
+  background: rgba(0,0,0,0.25);
+  border: 1px solid rgba(0,0,0,0.3);
+  padding: 10px 12px; margin-bottom: 4px;
+  display: flex; align-items: flex-start; gap: 8px;
+}
+.riparian-toggle-group input[type='checkbox'] {
+  margin-top: 2px; accent-color: var(--pb-riparian); cursor: pointer;
+}
+.riparian-toggle-label {
+  font-family: var(--font-body); font-size: 11px; font-weight: 700;
+  color: var(--pb-mist); cursor: pointer; display: block;
+}
+.riparian-toggle-note {
+  font-family: var(--font-body); font-size: 9px; color: var(--pb-sage);
+  margin-top: 2px; line-height: 1.3; display: block;
+}
+.flag-tag {
+  display: inline-block;
+  font-family: var(--font-body); font-size: 8px; font-weight: 700;
+  margin-left: 4px;
+  vertical-align: middle;
+  color: var(--pb-ink-muted);
+}
+.flag-tag.flag-riparian { color: var(--pb-riparian); }
+.flag-tag.flag-pest { color: var(--pb-danger); }
+
 .gjam-outer { height: calc(100vh - 110px); display: flex; }
 
-/* Species sidebar */
 .gjam-sidebar {
   width: 230px; min-width: 230px;
   background: var(--pb-parchment);
@@ -587,7 +523,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .gjam-sp-item.active { background: var(--pb-understory); color: white; font-style: italic; }
 .gjam-sp-item.active:hover { background: var(--pb-understory); }
 
-/* GJAM map area */
 .gjam-map-area { flex: 1; display: flex; flex-direction: column; }
 .gjam-topbar {
   display: flex; align-items: center; gap: 14px; padding: 8px 14px; flex-shrink: 0;
@@ -636,7 +571,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .legend-labels { display: flex; justify-content: space-between; margin-top: 2px; }
 .legend-labels span { font-family: var(--font-body); font-size: 9px; color: var(--pb-ink-muted); }
 
-/* ── Decision-Making dashboard ───────────────────────────── */
 .dm-outer { height: calc(100vh - 110px); display: flex; flex-direction: column; background: var(--pb-parchment); }
 .dm-topbar {
   display: flex; align-items: center; gap: 14px; padding: 8px 14px; flex-shrink: 0;
@@ -652,7 +586,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 
 .dm-main { flex: 1; display: flex; min-height: 0; overflow: hidden; }
 
-/* Left panel: weights + species list */
 .dm-left {
   width: 220px; min-width: 220px;
   background: var(--pb-canopy);
@@ -685,7 +618,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .dm-sp-row.selected .dm-sp-score { color: #A8D8C0; }
 .dm-no-data { padding: 20px 12px; font-family: var(--font-body); font-size: 11px; color: var(--pb-sage); text-align: center; }
 
-/* Center panel: score breakdown dashboard */
 .dm-center {
   flex: 1; min-width: 0; display: flex; flex-direction: column;
   border-right: 1px solid var(--pb-pine-line);
@@ -705,7 +637,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .dm-panel-subtitle { font-family: var(--font-body); font-size: 10px; color: var(--pb-ink-muted); }
 .dm-panel-body { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
 
-/* Score metric cards row */
 .dm-metric-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .dm-metric-card {
   background: white;
@@ -725,7 +656,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .dm-metric-card.total-card .dm-metric-val { color: var(--pb-accent-hi); }
 .dm-metric-raw { font-family: var(--font-body); font-size: 10px; color: var(--pb-ink-muted); margin-top: 2px; }
 
-/* Chart blocks */
 .dm-chart-block {
   background: white;
   border: 1px solid var(--pb-pine-line);
@@ -745,7 +675,6 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 .bar-row.hl .bar-sp-name { color: var(--pb-accent-hi); font-weight: 700; }
 .bar-row.hl .bar-val { color: var(--pb-accent-hi); }
 
-/* Right panel: wildlife subscores + pest */
 .dm-right {
   width: 230px; min-width: 230px;
   background: var(--pb-parchment);
@@ -768,64 +697,99 @@ body { font-family: var(--font-body); background: var(--pb-forest); color: var(-
 }
 .pest-alert b { display: block; font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; color: #FFD0D0; margin-bottom: 3px; }
 .pest-alert p { margin: 0; font-family: var(--font-body); font-size: 9px; color: #FFD0D0; line-height: 1.4; }
-.pest-flag-inline {
-  display: inline-block;
-  background: var(--pb-danger);
-  color: #FFD0D0;
-  font-family: var(--font-body); font-size: 9px; font-weight: 700;
-  padding: 1px 5px;
-  margin-left: 4px;
-  vertical-align: middle;
+
+.riparian-info {
+  background: white;
+  border: 1px solid var(--pb-pine-line);
+  border-left: 3px solid var(--pb-riparian);
+  padding: 9px 10px;
+}
+.riparian-info b {
+  display: block; font-family: var(--font-display); font-size: 9px; font-weight: 700;
+  letter-spacing: 0.07em; text-transform: uppercase; color: var(--pb-riparian); margin-bottom: 4px;
+}
+.riparian-info p { margin: 0; font-family: var(--font-body); font-size: 10px; color: var(--pb-ink); line-height: 1.4; }
+.riparian-info .ripar-no { color: var(--pb-ink-muted); font-style: italic; }
+
+.about-outer { height: calc(100vh - 110px); background: var(--pb-parchment); overflow-y: auto; }
+.about-inner { max-width: 900px; margin: 0 auto; padding: 48px 32px 64px; }
+.about-heading {
+  font-family: var(--font-display); font-size: 32px; font-weight: 700;
+  color: var(--pb-forest); margin: 0 0 8px 0; text-align: center;
+}
+.about-subheading {
+  font-family: var(--font-body); font-size: 13px; color: var(--pb-ink-muted);
+  text-align: center; margin: 0 0 40px 0; line-height: 1.6;
+}
+.about-team-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.about-card {
+  background: white; border: 1px solid var(--pb-pine-line);
+  padding: 20px 18px; text-align: center;
+}
+.about-photo {
+  width: 120px; height: 120px; border-radius: 50%;
+  object-fit: cover; margin: 0 auto 14px;
+  border: 3px solid var(--pb-linen); display: block;
+}
+.about-name {
+  font-family: var(--font-display); font-size: 15px; font-weight: 700;
+  color: var(--pb-forest); margin: 0 0 2px 0;
+}
+.about-role {
+  font-family: var(--font-body); font-size: 10px; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--pb-understory);
+  margin: 0 0 10px 0;
+}
+.about-bio {
+  font-family: var(--font-body); font-size: 11.5px; color: var(--pb-ink-muted);
+  line-height: 1.55; text-align: left;
 }
 
-/* ── About tab ───────────────────────────────────────────── */
-.about-outer { height: calc(100vh - 110px); background: var(--pb-parchment); }
-
-/* ── Shared utilities ────────────────────────────────────── */
 .no-data-msg { padding: 24px 14px; text-align: center; color: var(--pb-ink-muted); font-family: var(--font-body); font-size: 12px; }
 .container-fluid { padding: 0 !important; }
 .row { margin: 0 !important; }
 
-/* Scrollbar styling for dark sidebars */
 .dm-left ::-webkit-scrollbar, .gjam-species-list::-webkit-scrollbar { width: 5px; }
 .dm-left ::-webkit-scrollbar-track, .gjam-species-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
 .dm-left ::-webkit-scrollbar-thumb, .gjam-species-list::-webkit-scrollbar-thumb { background: var(--pb-sage); }
 "
 
-# -- Helper: bar fill color ---------------------------------------------------
 score_color_css <- function(norm_val, type="composite") {
   if (is.na(norm_val)) return("#C8CCC8")
   if (type == "gjam")     return(sprintf("rgba(31,111,204,%.2f)",  0.3 + norm_val*0.7))
   if (type == "wildlife") return(sprintf("rgba(212,59,59,%.2f)",   0.3 + norm_val*0.7))
   if (type == "timber")   return(sprintf("rgba(217,163,0,%.2f)",   0.3 + norm_val*0.7))
-  # composite
   if (norm_val >= 0.75) return("#2E7D4A")
   if (norm_val >= 0.5)  return("#3A8A5A")
   if (norm_val >= 0.25) return("#5AAA72")
   return("#8AC888")
 }
 
-# -- UI -----------------------------------------------------------------------
+RIPARIAN_BOOST <- 0.12
+
+apply_riparian_boost <- function(score, ba_codes, riparian_on) {
+  if (!isTRUE(riparian_on)) return(score)
+  is_riparian <- wildlife_data$riparian_recommended[match(ba_codes, wildlife_data$ba_code)]
+  is_riparian <- ifelse(is.na(is_riparian), FALSE, is_riparian)
+  ifelse(is_riparian, pmin(score + RIPARIAN_BOOST, 1), score)
+}
+
 ui <- fluidPage(
   tags$head(
     tags$style(HTML(app_css)),
     tags$script(HTML("
-// Species selection in Decision-Making tab
 $(document).on('click', '.dm-sp-row', function() {
   $('.dm-sp-row').removeClass('selected'); $(this).addClass('selected');
   Shiny.setInputValue('dm_selected_species', $(this).data('key'), {priority:'event'});
 });
-// Time period toggle
 $(document).on('click', '.time-seg', function() {
   $('.time-seg').removeClass('active'); $(this).addClass('active');
   Shiny.setInputValue('time_range', $(this).data('val'), {priority:'event'});
 });
-// GJAM species selection
 $(document).on('click', '.gjam-sp-item', function() {
   $('.gjam-sp-item').removeClass('active'); $(this).addClass('active');
   Shiny.setInputValue('gjam_selected_species', $(this).data('key'), {priority:'event'});
 });
-// GJAM search filter
 $(document).on('input', '#gjam_search', function() {
   var q = $(this).val().toLowerCase();
   $('.gjam-sp-item').each(function() {
@@ -847,7 +811,6 @@ $(document).on('input', '#gjam_search', function() {
   
   tabsetPanel(id="main_tabs",
               
-              # ── Tab 1: Home ────────────────────────────────────────
               tabPanel("Home",
                        div(class="welcome-tab",
                            div(class="welcome-panel",
@@ -861,7 +824,6 @@ $(document).on('input', '#gjam_search', function() {
                        )
               ),
               
-              # ── Tab 2: Location ────────────────────────────────────
               tabPanel("Location",
                        div(class="tab1-layout",
                            div(class="sidebar-col",
@@ -869,23 +831,31 @@ $(document).on('input', '#gjam_search', function() {
                                div(class="weight-group",
                                    div(class="weight-label", "GJAM Climate Score"),
                                    sliderInput("w1", NULL, min=0, max=1, value=0, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "Climate suitability from GJAM model (RCP 4.5)")
+                                   div(class="weight-note", "Predicted BA in plots across US by given timeframe")
                                ),
                                div(class="weight-group",
                                    div(class="weight-label", "Wildlife Value"),
                                    sliderInput("w2", NULL, min=0, max=1, value=0, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "Intrinsic wildlife score: mast, insects, pollinators, browse")
+                                   div(class="weight-note", "Combined scores from fruit, insects, pollinators, and deer")
                                ),
                                div(class="weight-group",
                                    div(class="weight-label", "Timber Market Value"),
                                    sliderInput("w3", NULL, min=0, max=1, value=0, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "USFS regional stumpage price. Missing species: re-weighted to remaining two scores.")
+                                   div(class="weight-note", "Regional price based on official 2025 timber sales directly with USFS.")
+                               ),
+                               div(class="riparian-toggle-group",
+                                   tags$input(type="checkbox", id="riparian_priority"),
+                                   tags$label(`for`="riparian_priority",
+                                              tags$span(class="riparian-toggle-label", "Prioritize riparian species"),
+                                              tags$span(class="riparian-toggle-note",
+                                                        "Favors species recommended for streambank and wetland-edge planting.")
+                                   )
                                ),
                                tags$hr(style="border-color:rgba(255,255,255,0.1); margin: 14px 0;"),
                                tags$span(class="sidebar-section-label", "Climate Period"),
                                div(class="time-toggle",
-                                   div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
-                                   div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
+                                   div(class="time-seg active", `data-val`="2040_2069", "2040-2069"),
+                                   div(class="time-seg",        `data-val`="2070_2099", "2070-2099")
                                ),
                                tags$hr(style="border-color:rgba(255,255,255,0.1); margin: 14px 0;"),
                                uiOutput("map_sidebar_info")
@@ -907,31 +877,28 @@ $(document).on('input', '#gjam_search', function() {
                        )
               ),
               
-              # ── Tab 3: GJAM ────────────────────────────────────────
               tabPanel("GJAM",
                        div(class="gjam-outer",
                            
-                           # Left: scrollable species list + search
                            div(class="gjam-sidebar",
                                div(class="gjam-sidebar-header",
                                    tags$h4("Species"),
                                    tags$input(id="gjam_search", class="gjam-search",
-                                              type="text", placeholder="Filter species…")
+                                              type="text", placeholder="Filter species...")
                                ),
                                div(class="gjam-species-list",
                                    uiOutput("gjam_species_list_ui")
                                )
                            ),
                            
-                           # Right: map + topbar
                            div(class="gjam-map-area",
                                div(class="gjam-topbar",
                                    uiOutput("gjam_species_title_ui"),
                                    div(class="time-toggle-wrap",
                                        div(class="time-toggle-label", "Period"),
                                        div(class="time-toggle",
-                                           div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
-                                           div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
+                                           div(class="time-seg active", `data-val`="2040_2069", "2040-2069"),
+                                           div(class="time-seg",        `data-val`="2070_2099", "2070-2099")
                                        )
                                    )
                                ),
@@ -943,19 +910,17 @@ $(document).on('input', '#gjam_search', function() {
                        )
               ),
               
-              # ── Tab 4: Decision-Making ─────────────────────────────
               tabPanel("Decision-Making",
                        div(class="dm-outer",
                            
-                           # Top bar: location + time
                            div(class="dm-topbar",
                                div(class="dm-topbar-title", "Species Scoring Dashboard"),
                                uiOutput("dm_loc_label"),
                                div(class="dm-time-controls",
                                    div(class="time-toggle-label", "Climate period"),
                                    div(class="time-toggle",
-                                       div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
-                                       div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
+                                       div(class="time-seg active", `data-val`="2040_2069", "2040-2069"),
+                                       div(class="time-seg",        `data-val`="2070_2099", "2070-2099")
                                    )
                                ),
                                uiOutput("dm_region_label")
@@ -963,7 +928,6 @@ $(document).on('input', '#gjam_search', function() {
                            
                            div(class="dm-main",
                                
-                               # Left column: species list
                                div(class="dm-left",
                                    div(class="dm-left-section",
                                        tags$span(class="dm-section-label", "Top 10 by composite score")
@@ -973,16 +937,13 @@ $(document).on('input', '#gjam_search', function() {
                                    )
                                ),
                                
-                               # Center column: score breakdown + bar charts
                                div(class="dm-center",
                                    div(class="dm-panel-header",
                                        div(class="dm-panel-title", "Score Breakdown"),
                                        uiOutput("dm_selected_name")
                                    ),
                                    div(class="dm-panel-body",
-                                       # 4 metric cards
                                        uiOutput("dm_metric_cards"),
-                                       # Bar charts
                                        div(class="dm-chart-block",
                                            tags$span(class="dm-chart-label", "All 10 species, composite score"),
                                            uiOutput("dm_composite_bars")
@@ -994,13 +955,13 @@ $(document).on('input', '#gjam_search', function() {
                                    )
                                ),
                                
-                               # Right column: wildlife subscores + pest info
                                div(class="dm-right",
                                    div(class="dm-panel-header",
                                        div(class="dm-panel-title", "Wildlife Detail")
                                    ),
                                    div(class="dm-right-body",
                                        uiOutput("dm_wildlife_subscores"),
+                                       uiOutput("dm_riparian_info"),
                                        uiOutput("dm_pest_info")
                                    )
                                )
@@ -1008,15 +969,54 @@ $(document).on('input', '#gjam_search', function() {
                        )
               ),
               
-              # ── Tab 5: About ───────────────────────────────────────
               tabPanel("About",
-                       div(class="about-outer")
+                       div(class="about-outer",
+                           div(class="about-inner",
+                               div(class="about-heading", "About PBGJAM"),
+                               div(class="about-subheading",
+                                   "PBGJAM v2 was developed by Tate Commission, Dr. Tong Qiu, and ",
+                                   "Dr. James Clark from Duke University."
+                               ),
+                               div(class="about-team-grid",
+                                   div(class="about-card",
+                                       tags$img(class="about-photo", src="tatecommission.png", alt="Tate Commission"),
+                                       div(class="about-name", "Tate Commission"),
+                                       div(class="about-role", "Lead Developer"),
+                                       div(class="about-bio",
+                                           "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod ",
+                                           "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim ",
+                                           "veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea ",
+                                           "commodo consequat."
+                                       )
+                                   ),
+                                   div(class="about-card",
+                                       tags$img(class="about-photo", src="tongqiu.png", alt="Dr. Tong Qiu"),
+                                       div(class="about-name", "Dr. Tong Qiu"),
+                                       div(class="about-role", "Faculty Advisor"),
+                                       div(class="about-bio",
+                                           "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum ",
+                                           "dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non ",
+                                           "proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+                                       )
+                                   ),
+                                   div(class="about-card",
+                                       tags$img(class="about-photo", src="jamesclark.png", alt="Dr. James Clark"),
+                                       div(class="about-name", "Dr. James Clark"),
+                                       div(class="about-role", "Faculty Advisor"),
+                                       div(class="about-bio",
+                                           "Sed ut perspiciatis unde omnis iste natus error sit voluptatem ",
+                                           "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ",
+                                           "ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt."
+                                       )
+                                   )
+                               )
+                           )
+                       )
               )
               
-  ) # end tabsetPanel
+  )
 )
 
-# -- Server -------------------------------------------------------------------
 server <- function(input, output, session) {
   
   rv <- reactiveValues(
@@ -1032,15 +1032,16 @@ server <- function(input, output, session) {
     rv$time_range <- input$time_range
   })
   
-  # -- Composite scoring (reacts to location, weights, and time period) -------
   composite_scores <- reactive({
     if (is.null(rv$click_lng)) return(NULL)
     all_sp <- tryCatch(get_all_species(rv$click_lng, rv$click_lat), error=function(e) NULL)
     if (is.null(all_sp)) return(NULL)
     keys <- all_sp$key
     
-    gjam_raw  <- get_gjam_vals(rv$click_lng, rv$click_lat, keys, rv$time_range)
-    gjam_n    <- norm_global(gjam_raw, gjam_range)
+    gjam_result    <- get_gjam_vals(rv$click_lng, rv$click_lat, keys, rv$time_range)
+    gjam_raw       <- gjam_result$values
+    gjam_n         <- norm_global(gjam_raw, gjam_range)
+    gjam_fallback_keys <- gjam_result$fallback_keys
     
     wild_raw  <- wildlife_data$wildlife_value_index[match(keys, wildlife_data$ba_code)]
     wild_n    <- norm_global(wild_raw, wildlife_range)
@@ -1050,16 +1051,19 @@ server <- function(input, output, session) {
     
     composite <- weighted_composite_full(gjam_n, wild_n, timber_n, input$w1, input$w2, input$w3)
     
+    final_score <- apply_riparian_boost(composite$score, keys, input$riparian_priority)
+    
     df <- data.frame(
-      key          = keys,
-      display_name = all_sp$display_name,
-      gjam         = round(gjam_n, 4),
-      wildlife     = round(wild_n, 4),
-      timber       = round(timber_n, 4),
-      score        = round(composite$score, 4),
-      n_components = composite$n_components,
-      timber_raw   = round(timber_prices, 2),
-      wildlife_raw = round(wild_raw, 1),
+      key            = keys,
+      display_name   = all_sp$display_name,
+      gjam           = round(gjam_n, 4),
+      wildlife       = round(wild_n, 4),
+      timber         = round(timber_n, 4),
+      score          = round(final_score, 4),
+      n_components   = composite$n_components,
+      timber_raw     = round(timber_prices, 2),
+      wildlife_raw   = round(wild_raw, 1),
+      gjam_is_genus_avg = keys %in% gjam_fallback_keys,
       stringsAsFactors = FALSE
     )
     df[order(df$score, decreasing=TRUE, na.last=TRUE), ]
@@ -1071,7 +1075,6 @@ server <- function(input, output, session) {
     head(df, 10)
   })
   
-  # -- Location tab -----------------------------------------------------------
   POPUP_ZOOM <- 14
   
   output$main_map <- renderLeaflet({
@@ -1137,9 +1140,13 @@ server <- function(input, output, session) {
       tags$span(class="sidebar-section-label", style="margin-top:0;", "Top species at site"),
       tagList(lapply(seq_len(min(5,nrow(df))), function(i) {
         row <- df[i,]
+        wd  <- wildlife_data[wildlife_data$ba_code == row$key, ]
+        is_riparian <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
         div(style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);",
             div(style="font-family:var(--font-body);font-size:9px;font-weight:700;color:var(--pb-sage);width:14px;", i),
-            div(style="font-family:var(--font-body);font-style:italic;font-size:11px;color:var(--pb-mist);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;", row$display_name),
+            div(style="font-family:var(--font-body);font-style:italic;font-size:11px;color:var(--pb-mist);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;",
+                row$display_name,
+                if (is_riparian) tags$span(class="flag-tag flag-riparian", "RP") else NULL),
             div(style="font-family:var(--font-body);font-size:10px;font-weight:700;color:var(--pb-accent);", sprintf("%.3f",row$score))
         )
       }))
@@ -1159,7 +1166,6 @@ server <- function(input, output, session) {
       setView(lng=-96, lat=38, zoom=POPUP_ZOOM)
   })
   
-  # -- GJAM tab ---------------------------------------------------------------
   output$gjam_map <- renderLeaflet({
     leaflet(options=leafletOptions(zoomControl=TRUE)) %>%
       addProviderTiles("CartoDB.Positron", options=providerTileOptions(maxZoom=12)) %>%
@@ -1167,7 +1173,6 @@ server <- function(input, output, session) {
       setView(lng=-96, lat=38, zoom=4)
   })
   
-  # Build species list UI for GJAM tab
   output$gjam_species_list_ui <- renderUI({
     keys_available <- names(all_gjam_display)
     sel <- input$gjam_selected_species
@@ -1195,7 +1200,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # Load GJAM raster when species or period changes (GJAM tab)
   observeEvent(list(input$gjam_selected_species, input$time_range), {
     key    <- input$gjam_selected_species
     period <- if (!is.null(input$time_range)) input$time_range else "2040_2069"
@@ -1252,7 +1256,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # -- Decision-Making tab ----------------------------------------------------
   output$dm_loc_label <- renderUI({
     if (is.null(rv$click_lat))
       div(class="dm-loc-text", "No site selected. Click the map on the Location tab.")
@@ -1267,7 +1270,6 @@ server <- function(input, output, session) {
       NULL
   })
   
-  # Species list (left panel)
   output$dm_species_list <- renderUI({
     df  <- top10_scored()
     sel <- input$dm_selected_species
@@ -1278,16 +1280,18 @@ server <- function(input, output, session) {
       row <- df[i,]
       cls <- if (!is.null(sel) && identical(row$key, sel)) "dm-sp-row selected" else "dm-sp-row"
       wd  <- wildlife_data[wildlife_data$ba_code == row$key, ]
-      pest_flag <- nrow(wd) > 0 && isTRUE(wd$has_pest_flag[1])
+      pest_flag     <- nrow(wd) > 0 && isTRUE(wd$has_pest_flag[1])
+      riparian_flag <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
       div(class=cls, `data-key`=row$key,
           div(class="dm-sp-rank", i),
           div(class="dm-sp-name", row$display_name,
-              if (pest_flag) tags$span(class="pest-flag-inline", "PEST") else NULL),
+              if (isTRUE(input$riparian_priority) && riparian_flag)
+                tags$span(class="flag-tag flag-riparian", "RP") else NULL,
+              if (pest_flag) tags$span(class="flag-tag flag-pest", "PEST") else NULL),
           div(class="dm-sp-score", sprintf("%.3f", row$score))
       )
     })
     
-    # Auto-select top species if nothing selected
     if (is.null(sel) || !(sel %in% df$key)) {
       top_key <- df$key[1]
       items <- c(items, list(tags$script(HTML(sprintf(
@@ -1298,33 +1302,41 @@ server <- function(input, output, session) {
     tagList(items)
   })
   
-  # Selected species name display
   output$dm_selected_name <- renderUI({
     key <- input$dm_selected_species
-    if (is.null(key) || !key %in% names(species_display)) return(div(class="dm-panel-subtitle", "—"))
+    if (is.null(key) || !key %in% names(species_display)) return(div(class="dm-panel-subtitle", "-"))
     div(class="dm-panel-subtitle", species_display[key])
   })
   
-  # 4 metric cards for selected species
   output$dm_metric_cards <- renderUI({
     df  <- top10_scored()
     key <- input$dm_selected_species
     if (is.null(df) || is.null(key)) {
       return(div(class="dm-metric-row",
-                 div(class="dm-metric-card gjam-card",  div(class="dm-metric-label","GJAM"), div(class="dm-metric-val","—")),
-                 div(class="dm-metric-card wild-card",  div(class="dm-metric-label","Wildlife"), div(class="dm-metric-val","—")),
-                 div(class="dm-metric-card timb-card",  div(class="dm-metric-label","Timber"), div(class="dm-metric-val","—")),
-                 div(class="dm-metric-card total-card", div(class="dm-metric-label","Total"), div(class="dm-metric-val","—"))
+                 div(class="dm-metric-card gjam-card",  div(class="dm-metric-label","GJAM"), div(class="dm-metric-val","-")),
+                 div(class="dm-metric-card wild-card",  div(class="dm-metric-label","Wildlife"), div(class="dm-metric-val","-")),
+                 div(class="dm-metric-card timb-card",  div(class="dm-metric-label","Timber"), div(class="dm-metric-val","-")),
+                 div(class="dm-metric-card total-card", div(class="dm-metric-label","Total"), div(class="dm-metric-val","-"))
       ))
     }
     row <- df[df$key == key, ]
     if (nrow(row)==0) return(NULL)
-    fmt <- function(x) if (is.na(x)) "—" else sprintf("%.3f", x)
+    fmt <- function(x) if (is.na(x)) "-" else sprintf("%.3f", x)
+    riparian_note <- if (isTRUE(input$riparian_priority)) {
+      wd <- wildlife_data[wildlife_data$ba_code == key, ]
+      if (nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1]))
+        paste0("+", RIPARIAN_BOOST, " riparian boost applied")
+      else "no riparian boost (not recommended)"
+    } else NULL
     div(class="dm-metric-row",
         div(class="dm-metric-card gjam-card",
             div(class="dm-metric-label", "GJAM"),
             div(class="dm-metric-val", fmt(row$gjam[1])),
-            div(class="dm-metric-raw", "climate suitability (normalized)")
+            div(class="dm-metric-raw",
+                if (isTRUE(row$gjam_is_genus_avg[1]))
+                  "genus average (no direct data for this species)"
+                else
+                  "climate suitability (normalized)")
         ),
         div(class="dm-metric-card wild-card",
             div(class="dm-metric-label", "Wildlife"),
@@ -1342,7 +1354,8 @@ server <- function(input, output, session) {
             div(class="dm-metric-label", "Composite"),
             div(class="dm-metric-val", fmt(row$score[1])),
             div(class="dm-metric-raw",
-                if (!is.na(row$n_components[1]) && row$n_components[1] < 3)
+                if (!is.null(riparian_note)) riparian_note
+                else if (!is.na(row$n_components[1]) && row$n_components[1] < 3)
                   paste0("based on ", row$n_components[1], " of 3 components")
                 else
                   "based on 3 of 3 components")
@@ -1350,11 +1363,10 @@ server <- function(input, output, session) {
     )
   })
   
-  # Composite bar chart (all 10 species)
   output$dm_composite_bars <- renderUI({
     df  <- top10_scored()
     sel <- input$dm_selected_species
-    if (is.null(df)) return(div(class="no-data-msg", "—"))
+    if (is.null(df)) return(div(class="no-data-msg", "-"))
     tagList(lapply(seq_len(nrow(df)), function(i) {
       row    <- df[i,]
       is_sel <- !is.null(sel) && identical(row$key, sel)
@@ -1364,18 +1376,16 @@ server <- function(input, output, session) {
           div(class="bar-sp-name", row$display_name),
           div(class="bar-track",
               div(class="bar-fill", style=sprintf("width:%.1f%%;background:%s;", pct, col))),
-          div(class="bar-val", if (!is.na(row$score)) sprintf("%.3f",row$score) else "—")
+          div(class="bar-val", if (!is.na(row$score)) sprintf("%.3f",row$score) else "-")
       )
     }))
   })
   
-  # Stacked component bar chart (shows all 3 components per species)
   output$dm_component_bars <- renderUI({
     df  <- top10_scored()
     sel <- input$dm_selected_species
-    if (is.null(df)) return(div(class="no-data-msg", "—"))
+    if (is.null(df)) return(div(class="no-data-msg", "-"))
     
-    # Three mini-bar rows per species: GJAM / Wildlife / Timber
     header <- div(style="display:flex;gap:12px;margin-bottom:6px;",
                   div(style="width:110px;flex-shrink:0;"),
                   div(style="flex:1;display:flex;gap:4px;",
@@ -1406,14 +1416,13 @@ server <- function(input, output, session) {
     tagList(header, rows)
   })
   
-  # Wildlife subscores (right panel)
   output$dm_wildlife_subscores <- renderUI({
     key <- input$dm_selected_species
     if (is.null(key)) return(div(class="no-data-msg", "Select a species"))
     wd <- wildlife_data[wildlife_data$ba_code == key, ]
     if (nrow(wd)==0) return(div(class="no-data-msg", "No wildlife data"))
     
-    fmt_sub <- function(x) if (is.na(x)) "—" else sprintf("%.1f", x)
+    fmt_sub <- function(x) if (is.na(x)) "-" else sprintf("%.1f", x)
     browse_desc <- switch(
       tolower(replace_na(wd$palatable_browse_animal[1],"unknown")),
       "high"   = "High palatability",
@@ -1423,7 +1432,7 @@ server <- function(input, output, session) {
     )
     mast_desc <- paste0(
       replace_na(wd$fruit_seed_abundance[1],"?"), " abundance",
-      if (!is.na(wd$berry_nut_seed_product[1]) && tolower(wd$berry_nut_seed_product[1])=="yes") " · mast producer" else ""
+      if (!is.na(wd$berry_nut_seed_product[1]) && tolower(wd$berry_nut_seed_product[1])=="yes") " - mast producer" else ""
     )
     lep_count <- if (!is.na(wd$lep_spp_supported[1])) paste0(wd$lep_spp_supported[1], " Lep spp.") else "No data"
     bloom_desc <- if (!is.na(wd$bloom_period[1]) && nzchar(wd$bloom_period[1])) wd$bloom_period[1] else "No bloom data"
@@ -1458,6 +1467,33 @@ server <- function(input, output, session) {
           )
       )
     )
+  })
+  
+  output$dm_riparian_info <- renderUI({
+    key <- input$dm_selected_species
+    if (is.null(key)) return(NULL)
+    wd <- wildlife_data[wildlife_data$ba_code == key, ]
+    if (nrow(wd) == 0) return(NULL)
+    
+    is_recommended <- isTRUE(wd$riparian_recommended[1])
+    category       <- wd$riparian_category[1]
+    wettest        <- wd$wetland_wettest[1]
+    
+    if (is_recommended) {
+      div(class="riparian-info",
+          tags$b("Riparian status"),
+          tags$p(
+            if (!is.na(category) && nzchar(category)) category else "Recommended for riparian planting",
+            if (!is.na(wettest) && nzchar(wettest)) paste0(" (wetland indicator: ", wettest, ")") else ""
+          )
+      )
+    } else {
+      div(class="riparian-info",
+          tags$b("Riparian status"),
+          tags$p(class="ripar-no",
+                 if (!is.na(category) && nzchar(category)) category else "Not typically riparian")
+      )
+    }
   })
   
   output$dm_pest_info <- renderUI({
