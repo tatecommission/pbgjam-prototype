@@ -14,7 +14,7 @@ wildlife_data <- read_csv(
   "~/Documents/PBGJAM-data-explorer/raw_data/v2/BA_wildlife_traits.csv",
   show_col_types = FALSE
 ) |>
-  select(
+  dplyr::select(
     ba_code, scientific_name,
     wildlife_value_index,
     cat_A, cat_B, cat_C, cat_D,
@@ -44,20 +44,35 @@ wildlife_data <- read_csv(
       TRUE ~ as.logical(riparian_recommended)
     )
   ) |>
-  select(-has_pest_flag_raw)
+  dplyr::select(-has_pest_flag_raw)
 
 wildlife_range <- range(wildlife_data$wildlife_value_index, na.rm = TRUE)
 
 coords_lon <- xdata$lon
 coords_lat <- xdata$lat
-BA_mat     <- BA
+BA_mat <- BA
+
+local({
+  df <- as.data.frame(BA_mat)
+  ok <- vapply(df, function(col) is.numeric(col) || is.integer(col), logical(1))
+  if (!all(ok)) {
+    message(sprintf(
+      "BA: dropping %d non-numeric column(s) before matrix conversion: %s",
+      sum(!ok), paste(names(df)[!ok], collapse=", ")
+    ))
+  }
+  m <- as.matrix(df[, ok, drop = FALSE])
+  mode(m) <- "double"
+  m[is.na(m)] <- 0
+  BA_mat <<- m
+})
 
 timber <- read_csv(
   "~/Documents/PBGJAM-data-explorer/USFScut-sold-reports/timber_price_by_gjam_species_wide.csv",
   show_col_types = FALSE
 )
 
-fmt_species <- function(nm) {
+fmt_species_fallback <- function(nm) {
   parts <- strsplit(nm, "(?<=[a-z])(?=[A-Z])", perl = TRUE)[[1]]
   if (length(parts) < 2)
     return(paste0(toupper(substr(nm,1,1)), tolower(substr(nm,2,nchar(nm)))))
@@ -66,8 +81,30 @@ fmt_species <- function(nm) {
   paste(genus, epithet)
 }
 
-species_names   <- colnames(BA_mat)
-species_display <- setNames(sapply(species_names, fmt_species, USE.NAMES=FALSE), species_names)
+species_names <- colnames(BA_mat)
+wl_lookup <- setNames(as.character(wildlife_data$scientific_name), as.character(wildlife_data$ba_code))
+
+species_display <- setNames(
+  vapply(species_names, function(nm) {
+    sn <- as.character(wl_lookup[nm])
+    if (length(sn) == 1L && !is.na(sn) && nzchar(trimws(sn))) {
+      raw <- trimws(sn)
+      parts <- strsplit(raw, "\\s+")[[1]]
+      parts <- parts[nzchar(parts)]
+      if (length(parts) >= 2) {
+        paste0(toupper(substr(parts[1],1,1)), tolower(substr(parts[1],2,nchar(parts[1]))),
+               " ", paste(tolower(parts[-1]), collapse=" "))
+      } else if (length(parts) == 1) {
+        paste0(toupper(substr(parts[1],1,1)), tolower(substr(parts[1],2,nchar(parts[1]))))
+      } else {
+        fmt_species_fallback(nm)
+      }
+    } else {
+      fmt_species_fallback(nm)
+    }
+  }, FUN.VALUE = character(1), USE.NAMES = FALSE),
+  species_names
+)
 
 .gjam_base <- path.expand(
   "~/Documents/PBGJAM-data-explorer/data4Tate/gjamCreateMap/Trees/PredRasScale/rcp45"
@@ -132,7 +169,8 @@ get_timber_price <- function(lng, lat, species_key) {
   region <- get_usfs_region(lng, lat)
   price_for_region <- function(reg) {
     if (!reg %in% names(row)) return(NA_real_)
-    v <- row[[reg]][1]; if (is.na(v)||!is.finite(v)) NA_real_ else as.numeric(v)
+    v <- suppressWarnings(as.numeric(row[[reg]][1]))
+    if (is.na(v) || !is.finite(v)) NA_real_ else v
   }
   p <- price_for_region(region)
   if (!is.na(p)) return(p)
@@ -146,34 +184,21 @@ get_timber_price <- function(lng, lat, species_key) {
   NA_real_
 }
 
-message("Building GJAM raster stacks...")
-.gjam_stack <- lapply(c("2040_2069","2070_2099"), function(period) {
-  tifs <- unname(gjam_files[[period]])
-  tifs <- tifs[file.exists(tifs)]
-  if (length(tifs) == 0) return(NULL)
-  s   <- terra::rast(tifs)
-  nms <- sub(paste0("_",period,"_rcp45\\.tif$"), "",
-             sub("^mean_","", basename(terra::sources(s))))
-  names(s) <- nms
-  s
-})
-names(.gjam_stack) <- c("2040_2069","2070_2099")
-
-message("  2040-2069: ", terra::nlyr(.gjam_stack[["2040_2069"]]), " layers")
-message("  2070-2099: ", terra::nlyr(.gjam_stack[["2070_2099"]]), " layers")
-
 gjam_range <- local({
-  s    <- .gjam_stack[["2040_2069"]]
-  vals <- unlist(lapply(seq_len(terra::nlyr(s)), function(i) {
-    v <- terra::values(s[[i]], na.rm=TRUE); v[is.finite(v)]
+  tifs <- unname(gjam_files[["2040_2069"]])
+  tifs <- tifs[file.exists(tifs)]
+  if (length(tifs) == 0) return(c(0, 1))
+  sample_tifs <- tifs[seq(1, length(tifs), length.out = min(20, length(tifs)))]
+  vals <- unlist(lapply(sample_tifs, function(f) {
+    v <- terra::values(terra::rast(f), na.rm = TRUE)
+    v[is.finite(v)]
   }))
-  c(min(vals), max(vals))
+  if (length(vals) == 0) c(0, 1) else c(min(vals), max(vals))
 })
-message("  GJAM value range: ", round(gjam_range[1],3), " to ", round(gjam_range[2],3))
 
 timber_range <- local({
   pc <- c("R1","R2","R3","R4","R5","R6","R8","R9","R10")
-  ap <- as.numeric(unlist(timber[,intersect(pc,names(timber))],use.names=FALSE))
+  ap <- suppressWarnings(as.numeric(unlist(timber[,intersect(pc,names(timber))],use.names=FALSE)))
   ap <- ap[is.finite(ap)]
   if (length(ap)==0) c(NA_real_,NA_real_) else c(min(ap),max(ap))
 })
@@ -222,44 +247,47 @@ thumbtack_icon <- makeIcon(
   iconWidth=32, iconHeight=50, iconAnchorX=16, iconAnchorY=48
 )
 
-# Candidate species list = every species present at the single nearest FIA
-# plot. The list only determines which species are scored at this location;
-# their actual BA there is never used in scoring (GJAM/wildlife/timber are
-# all computed independently of current abundance), so no distance weighting
-# or averaging is needed -- the nearest plot is simply the most relevant one.
-get_all_species <- function(lng, lat) {
-  d_km <- haversine_km(lng, lat, coords_lon, coords_lat)
-  idx  <- which.min(d_km)
-  
-  ba_row <- BA_mat[idx, ]
-  ba_row[is.na(ba_row)] <- 0
-  present <- names(ba_row)[ba_row > 0]
-  
-  data.frame(key = present, display_name = species_display[present],
+get_all_species <- function(lng, lat, k = 20) {
+  d_km    <- haversine_km(lng, lat, coords_lon, coords_lat)
+  idx     <- order(d_km)[seq_len(min(k, nrow(BA_mat)))]
+  sub     <- BA_mat[idx, , drop = FALSE]
+  if (!is.matrix(sub) || typeof(sub) == "list") {
+    sub <- matrix(as.numeric(unlist(sub)), nrow = length(idx),
+                  dimnames = list(NULL, colnames(BA_mat)))
+  }
+  present <- colnames(sub)[colSums(sub, na.rm = TRUE) > 0]
+  data.frame(key          = present,
+             display_name = as.character(species_display[present]),
              stringsAsFactors = FALSE)
 }
 
-# Returns a list with $values (named numeric vector) and $fallback_keys
-# (character vector of species whose value came from a genus average rather
-# than their own raster, so the UI can flag imprecise scores instead of
-# presenting them as equally precise to direct matches).
 get_gjam_vals <- function(lng, lat, keys, period) {
-  stack <- .gjam_stack[[period]]
-  if (is.null(stack))
+  files <- gjam_files[[period]]
+  if (is.null(files) || length(files) == 0)
     return(list(values=setNames(rep(NA_real_, length(keys)), keys), fallback_keys=character(0)))
-  pt       <- terra::vect(matrix(c(lng, lat), ncol=2), crs="EPSG:4326")
-  extracted <- tryCatch(
-    as.numeric(terra::extract(stack, pt)[1, -1]),
-    error = function(e) rep(NA_real_, terra::nlyr(stack))
-  )
-  names(extracted) <- names(stack)
-  all_keys <- names(stack)
+  
+  pt <- terra::vect(matrix(c(lng, lat), ncol=2), crs="EPSG:4326")
+  
+  extract_one <- function(fpath) {
+    tryCatch({
+      r <- terra::rast(fpath)
+      as.numeric(terra::extract(r, pt)[1, -1])
+    }, error = function(e) NA_real_)
+  }
+  
+  all_keys      <- names(files)
   fallback_keys <- character(0)
+  
   values <- sapply(keys, function(k) {
-    if (k %in% all_keys && is.finite(extracted[[k]])) return(extracted[[k]])
+    if (k %in% all_keys && file.exists(files[[k]])) {
+      v <- extract_one(files[[k]])
+      if (is.finite(v)) return(v)
+    }
     genus_lower <- tolower(regmatches(k, regexpr("^[a-z]+", k)))
-    genus_keys  <- all_keys[startsWith(tolower(all_keys), genus_lower)]
-    gv <- extracted[genus_keys]
+    genus_mask  <- startsWith(tolower(all_keys), genus_lower) &
+      file.exists(unlist(files[all_keys]))
+    genus_keys  <- all_keys[genus_mask]
+    gv <- vapply(genus_keys, function(gk) extract_one(files[[gk]]), numeric(1))
     gv <- gv[is.finite(gv)]
     if (length(gv) > 0) fallback_keys <<- c(fallback_keys, k)
     if (length(gv) == 0) NA_real_ else mean(gv)
@@ -295,523 +323,578 @@ load_gjam_raster_for_key <- function(key, period, agg_fact=3) {
 all_gjam_keys <- unique(c(names(gjam_files[["2040_2069"]]), names(gjam_files[["2070_2099"]])))
 all_gjam_display <- sort(species_display[intersect(all_gjam_keys, names(species_display))])
 
-# STYLE GUIDE - PBGJAM v2
-
+# ── CSS ───────────────────────────────────────────────────────────────────────
 app_css <- "
+@import url('https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap');
+
 :root {
-  --pb-forest:     #1C3A28;
-  --pb-canopy:     #2A4F38;
-  --pb-understory: #3D6B50;
-  --pb-sage:       #7DB89A;
-  --pb-mist:       #C8DDD4;
-  --pb-parchment:  #F4F7F5;
-  --pb-linen:      #E8EEE9;
-  --pb-pine-line:  #B4C8BC;
-  --pb-accent:     #3A8A5A;
-  --pb-accent-hi:  #2E7D4A;
-  --pb-timber:     #D9A300;
-  --pb-wildlife:   #D43B3B;
-  --pb-gjam:       #1F6FCC;
-  --pb-danger:     #8B1A1A;
-  --pb-riparian:   #2E8FA3;
-  --pb-ink:        #1A2E24;
-  --pb-ink-muted:  #5A7A68;
-  --font-display: 'Gill Sans', 'Gill Sans MT', Calibri, Arial, sans-serif;
-  --font-body:    Arial, 'Helvetica Neue', sans-serif;
+  --forest:   #1C3A28;
+  --canopy:   #2A5240;
+  --mid:      #3D7A58;
+  --sage:     #6BAE88;
+  --mist:     #C8DDD4;
+  --cream:    #F7F9F6;
+  --linen:    #EDF2EE;
+  --border:   #C2D5C8;
+  --accent:   #3A8A5A;
+  --accent-d: #2A6B43;
+  --gjam-c:   #2563EB;
+  --wild-c:   #B45309;
+  --timb-c:   #0E7490;
+  --comp-c:   #166534;
+  --danger:   #7F1D1D;
+  --rip:      #0369A1;
+  --ink:      #1A2E24;
+  --ink2:     #4A6A58;
+  --white:    #FFFFFF;
+  --radius:   10px;
+  --radius-sm:6px;
+  --shadow:   0 2px 8px rgba(0,0,0,0.10), 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-lg:0 8px 24px rgba(0,0,0,0.14), 0 2px 6px rgba(0,0,0,0.08);
+  --font: 'Lexend', sans-serif;
 }
 
 * { box-sizing: border-box; }
-body { font-family: var(--font-body); background: var(--pb-forest); color: var(--pb-ink); margin: 0; padding: 0; }
+body { font-family: var(--font); background: var(--forest); color: var(--ink); margin: 0; padding: 0; }
 
+/* ── Header ── */
 .app-header {
-  background: var(--pb-forest);
-  padding: 10px 24px;
+  background: linear-gradient(135deg, #0F2218 0%, var(--forest) 60%, #1A3D2B 100%);
+  padding: 0 28px;
+  height: 58px;
   display: flex; align-items: center; justify-content: space-between;
-  border-bottom: 2px solid #0E1F18;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.3);
 }
-.header-logo img { height: 36px; }
-.header-sponsors { display: flex; align-items: center; gap: 22px; }
-.header-sponsors img { height: 28px; opacity: 0.85; filter: brightness(0) invert(1); }
-.header-sponsors .nasa-logo { height: 44px; }
+.header-left { display: flex; align-items: center; gap: 18px; }
+.header-logo img { height: 32px; }
+.header-title {
+  font-family: var(--font);
+  font-size: 15px; font-weight: 600; letter-spacing: 0.02em;
+  color: #E0EEE6;
+  border-left: 1px solid rgba(255,255,255,0.15);
+  padding-left: 18px;
+}
+.header-sponsors { display: flex; align-items: center; gap: 20px; }
+.header-sponsors img { height: 24px; opacity: 0.7; filter: brightness(0) invert(1); }
+.header-sponsors .nasa-logo { height: 38px; }
 
+/* ── Tabs ── */
 .nav-tabs {
-  background: var(--pb-canopy) !important;
-  border-bottom: 2px solid #0C1C16 !important;
-  padding: 0 16px; margin: 0 !important;
+  background: var(--canopy) !important;
+  border-bottom: 1px solid rgba(0,0,0,0.25) !important;
+  padding: 0 20px; margin: 0 !important;
 }
 .nav-tabs > li > a {
-  font-family: var(--font-display);
-  font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
-  color: var(--pb-sage) !important;
-  border: 1px solid rgba(0,0,0,0.3) !important; border-bottom: none !important;
-  border-radius: 0 !important;
-  padding: 8px 20px !important; margin: 5px 2px 0 !important;
-  background: var(--pb-canopy) !important;
-  transition: background 0.1s, color 0.1s;
+  font-family: var(--font) !important;
+  font-size: 11px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--mist) !important;
+  border: none !important;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0 !important;
+  padding: 9px 20px !important; margin: 6px 2px 0 !important;
+  background: transparent !important;
+  transition: background 0.15s, color 0.15s;
 }
 .nav-tabs > li.active > a, .nav-tabs > li.active > a:focus {
-  color: var(--pb-forest) !important;
-  background: var(--pb-parchment) !important;
-  border-color: var(--pb-pine-line) !important;
+  color: var(--ink) !important;
+  background: var(--cream) !important;
+  border: none !important;
+  font-weight: 600 !important;
 }
 .nav-tabs > li > a:hover {
-  color: var(--pb-mist) !important;
-  background: var(--pb-understory) !important;
+  color: var(--white) !important;
+  background: rgba(255,255,255,0.1) !important;
 }
 .tab-content { padding: 0; }
 
+/* ── Welcome ── */
 .welcome-tab {
-  height: calc(100vh - 110px);
+  height: calc(100vh - 106px);
   background-image: url('forest-background.jpg');
   background-size: cover; background-position: center 40%;
   display: flex; align-items: center; justify-content: center;
 }
 .welcome-panel {
-  background: rgba(6,18,11,0.82);
+  background: rgba(6,18,11,0.86);
   padding: 56px 68px;
-  max-width: 720px; text-align: center;
-  border: 1px solid rgba(80,140,100,0.25);
+  max-width: 680px; text-align: center;
+  border-radius: 16px;
+  border: 1px solid rgba(100,180,130,0.2);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(6px);
 }
 .welcome-title {
-  font-family: var(--font-display);
-  font-size: 62px; font-weight: 700;
-  color: #E8F5EC; letter-spacing: 0.04em;
-  margin: 0 0 24px 0; line-height: 1;
-  text-shadow: 0 2px 14px rgba(0,0,0,0.95);
+  font-family: var(--font);
+  font-size: 58px; font-weight: 700;
+  color: #E8F5EC; letter-spacing: -0.01em;
+  margin: 0 0 20px 0; line-height: 1;
 }
 .welcome-desc {
-  font-family: var(--font-display);
-  font-size: 19px; color: #A4C4AC; line-height: 1.7;
-  font-weight: 400; margin: 0;
-  text-shadow: 0 1px 5px rgba(0,0,0,0.75);
+  font-family: var(--font);
+  font-size: 17px; color: #A4C4AC; line-height: 1.7;
+  font-weight: 300; margin: 0;
 }
 
-.tab1-layout { display: flex; height: calc(100vh - 110px); }
+/* ── Location tab ── */
+.tab1-layout { display: flex; height: calc(100vh - 106px); }
 .sidebar-col {
-  width: 260px; min-width: 260px;
-  background: var(--pb-canopy);
-  color: var(--pb-mist);
+  width: 300px; min-width: 300px;
+  background: var(--canopy);
   padding: 18px 14px; overflow-y: auto;
-  border-right: 2px solid #0C1C16;
+  border-right: 1px solid rgba(0,0,0,0.2);
 }
 .sidebar-section-label {
-  font-family: var(--font-display);
-  font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
-  color: var(--pb-sage); margin: 0 0 10px 0; display: block;
+  font-family: var(--font);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--sage); margin: 0 0 10px 0; display: block;
 }
 .weight-group {
-  background: rgba(0,0,0,0.25);
-  border: 1px solid rgba(0,0,0,0.3);
-  padding: 10px 12px 8px; margin-bottom: 10px;
+  background: rgba(0,0,0,0.2);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: var(--radius);
+  padding: 12px 14px 10px; margin-bottom: 10px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.15);
 }
 .weight-label {
-  font-family: var(--font-body);
-  font-size: 11px; font-weight: 700; color: var(--pb-mist); margin-bottom: 4px;
+  font-family: var(--font);
+  font-size: 11px; font-weight: 500; color: var(--mist); margin-bottom: 6px;
 }
 .weight-note {
-  font-family: var(--font-body);
-  font-size: 9px; color: var(--pb-sage); margin-top: 2px; line-height: 1.3;
+  font-family: var(--font);
+  font-size: 9px; color: var(--sage); margin-top: 4px; line-height: 1.4;
 }
-.irs--shiny .irs-bar { background: var(--pb-accent); height: 5px; }
-.irs--shiny .irs-line { background: rgba(0,0,0,0.35); height: 5px; }
+
+/* Skeuomorphic slider */
+.irs--shiny .irs-bar {
+  background: linear-gradient(to bottom, #5AAA78, #3A8A5A);
+  border-radius: 4px; height: 6px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+}
+.irs--shiny .irs-line {
+  background: linear-gradient(to bottom, #0C1C16, #1A3028);
+  border-radius: 4px; height: 6px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.4);
+}
 .irs--shiny .irs-handle {
-  background: var(--pb-mist); border-color: var(--pb-sage);
-  border-radius: 0 !important; width: 14px !important; height: 14px !important;
-  top: 22px !important;
+  background: linear-gradient(to bottom, #E8F0EB, #C8D8CC) !important;
+  border: 1px solid #8AB09A !important;
+  border-radius: 50% !important;
+  width: 18px !important; height: 18px !important;
+  top: 20px !important;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.8) !important;
+}
+.irs--shiny .irs-handle:hover {
+  background: linear-gradient(to bottom, #FFFFFF, #D8E8DC) !important;
 }
 .irs--shiny .irs-single {
-  background: var(--pb-understory);
-  border-radius: 0;
-  font-family: var(--font-body); font-size: 10px;
+  background: var(--accent-d);
+  border-radius: var(--radius-sm);
+  font-family: var(--font); font-size: 10px; font-weight: 500;
+  box-shadow: var(--shadow);
 }
+
+/* Riparian slider — blue tint */
+.riparian-group .irs--shiny .irs-bar {
+  background: linear-gradient(to bottom, #38A8C8, #0E6888);
+}
+.riparian-group .irs--shiny .irs-handle {
+  border-color: #38A8C8 !important;
+}
+
+.riparian-group {
+  background: rgba(0,0,0,0.2);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: var(--radius);
+  padding: 12px 14px 10px; margin-bottom: 10px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.15);
+}
+.riparian-toggle-note {
+  font-family: var(--font); font-size: 9px; color: var(--sage);
+  margin-top: 4px; line-height: 1.4; display: block;
+}
+
 .map-col { flex: 1; position: relative; overflow: hidden; }
 .map-col #main_map { height: 100%; width: 100%; }
 .coord-display {
   position: absolute; bottom: 18px; left: 18px; z-index: 1000;
-  background: rgba(28,58,40,0.92);
-  color: var(--pb-mist);
-  font-family: var(--font-body); font-size: 11px; font-weight: 700;
-  padding: 7px 14px;
-  border: 1px solid var(--pb-understory);
+  background: rgba(15,34,24,0.92);
+  color: var(--mist);
+  font-family: var(--font); font-size: 11px; font-weight: 500;
+  padding: 8px 16px;
+  border-radius: 20px;
+  border: 1px solid rgba(100,180,130,0.25);
+  box-shadow: var(--shadow);
   pointer-events: none;
 }
 .map-popups { position: absolute; top: 14px; left: 14px; z-index: 1000; display: flex; gap: 8px; pointer-events: none; }
 .map-popup-panel {
   width: 185px; height: 190px;
-  border: 1px solid rgba(80,160,110,0.4);
-  background: rgba(18,32,24,0.92);
+  border-radius: var(--radius);
+  border: 1px solid rgba(100,180,130,0.25);
+  background: rgba(15,30,20,0.92);
   display: flex; flex-direction: column; pointer-events: auto;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
 }
 .map-popup-header {
-  padding: 5px 9px;
-  background: rgba(28,58,40,0.95);
-  border-bottom: 1px solid rgba(80,160,110,0.25);
+  padding: 6px 10px;
+  background: rgba(20,50,32,0.95);
+  border-bottom: 1px solid rgba(100,180,130,0.15);
   flex-shrink: 0;
 }
-.map-popup-title { font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--pb-sage); }
+.map-popup-title { font-family: var(--font); font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--sage); }
 .map-popup-body { flex: 1; position: relative; overflow: hidden; }
 
-.riparian-group {
-  background: rgba(0,0,0,0.25);
-  border: 1px solid rgba(0,0,0,0.3);
-  padding: 10px 12px 8px; margin-bottom: 10px;
-}
-.riparian-group .irs--shiny .irs-bar { background: var(--pb-riparian); }
-.riparian-group .irs--shiny .irs-handle { background: var(--pb-mist); border-color: var(--pb-riparian); }
-.riparian-toggle-note {
-  font-family: var(--font-body); font-size: 9px; color: var(--pb-sage);
-  margin-top: 4px; line-height: 1.3; display: block;
-}
 .flag-tag {
   display: inline-block;
-  font-family: var(--font-body); font-size: 8px; font-weight: 700;
-  margin-left: 4px;
-  vertical-align: middle;
-  color: var(--pb-ink-muted);
+  font-family: var(--font); font-size: 8px; font-weight: 600;
+  margin-left: 4px; vertical-align: middle;
+  padding: 1px 5px; border-radius: 10px;
 }
-.flag-tag.flag-riparian { color: var(--pb-riparian); }
-.flag-tag.flag-pest { color: var(--pb-danger); }
+.flag-tag.flag-riparian { color: var(--rip); background: rgba(3,105,161,0.12); }
+.flag-tag.flag-pest { color: var(--danger); background: rgba(127,29,29,0.12); }
 
-.gjam-outer { height: calc(100vh - 110px); display: flex; }
+/* Time toggle */
+.time-toggle {
+  display: inline-flex;
+  border-radius: 20px;
+  background: rgba(0,0,0,0.25);
+  padding: 3px;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+.time-seg {
+  font-family: var(--font);
+  font-size: 10px; font-weight: 500;
+  padding: 5px 14px; cursor: pointer; user-select: none;
+  color: var(--mist); border-radius: 16px;
+  transition: background 0.15s, color 0.15s;
+}
+.time-seg.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent-d));
+  color: white;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
 
+/* ── GJAM tab ── */
+.gjam-outer { height: calc(100vh - 106px); display: flex; }
 .gjam-sidebar {
   width: 230px; min-width: 230px;
-  background: var(--pb-parchment);
-  border-right: 2px solid var(--pb-pine-line);
+  background: var(--cream);
+  border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
 }
 .gjam-sidebar-header {
   padding: 12px 12px 8px;
-  border-bottom: 1px solid var(--pb-pine-line);
-  background: var(--pb-linen);
-  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--linen); flex-shrink: 0;
 }
 .gjam-sidebar-header h4 {
-  font-family: var(--font-display);
-  font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
-  color: var(--pb-understory); margin: 0 0 6px 0;
+  font-family: var(--font);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--mid); margin: 0 0 6px 0;
 }
 .gjam-search {
-  width: 100%; padding: 5px 8px;
-  font-family: var(--font-body); font-size: 11px;
-  border: 1px solid var(--pb-pine-line);
-  background: white; color: var(--pb-ink);
-  border-radius: 0;
-  outline: none;
+  width: 100%; padding: 7px 10px;
+  font-family: var(--font); font-size: 11px;
+  border: 1px solid var(--border);
+  background: white; color: var(--ink);
+  border-radius: var(--radius-sm);
+  outline: none; box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
 }
-.gjam-search:focus { border-color: var(--pb-accent); }
+.gjam-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(58,138,90,0.15); }
 .gjam-species-list { flex: 1; overflow-y: auto; padding: 4px 0; }
 .gjam-sp-item {
-  padding: 7px 12px;
-  font-family: var(--font-body); font-style: italic; font-size: 11px;
-  color: var(--pb-ink);
-  cursor: pointer; border-bottom: 1px solid var(--pb-pine-line);
+  padding: 8px 12px;
+  font-family: var(--font); font-style: italic; font-size: 11px;
+  color: var(--ink); cursor: pointer;
+  border-bottom: 1px solid var(--linen);
   transition: background 0.1s;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.gjam-sp-item:hover { background: var(--pb-linen); }
-.gjam-sp-item.active { background: var(--pb-understory); color: white; font-style: italic; }
-.gjam-sp-item.active:hover { background: var(--pb-understory); }
+.gjam-sp-item:hover { background: var(--linen); }
+.gjam-sp-item.active { background: var(--mid); color: white; }
 
 .gjam-map-area { flex: 1; display: flex; flex-direction: column; }
 .gjam-topbar {
   display: flex; align-items: center; gap: 14px; padding: 8px 14px; flex-shrink: 0;
-  background: var(--pb-linen);
-  border-bottom: 1px solid var(--pb-pine-line);
+  background: var(--linen); border-bottom: 1px solid var(--border);
 }
 .gjam-species-title {
-  font-family: var(--font-body); font-style: italic; font-size: 13px;
-  color: var(--pb-ink); font-weight: 700; flex: 1; min-width: 0;
+  font-family: var(--font); font-style: italic; font-size: 13px;
+  color: var(--ink); font-weight: 500; flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .gjam-fallback-note {
-  font-family: var(--font-body); font-size: 10px; color: var(--pb-timber);
+  font-family: var(--font); font-size: 9px; color: #92400E;
+  background: #FEF3C7; padding: 3px 8px; border-radius: 10px;
   font-style: normal; flex-shrink: 0;
+  border: 1px solid #F59E0B;
 }
 .time-toggle-wrap { display: flex; align-items: center; gap: 8px; }
 .time-toggle-label {
-  font-family: var(--font-display);
-  font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
-  color: var(--pb-ink-muted); white-space: nowrap;
+  font-family: var(--font);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink2); white-space: nowrap;
 }
-.time-toggle {
-  display: inline-flex;
-  border: 1px solid var(--pb-pine-line);
-  background: white;
-}
-.time-seg {
-  font-family: var(--font-display);
-  font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
-  padding: 5px 14px; cursor: pointer; user-select: none;
-  color: var(--pb-ink-muted); transition: background 0.1s, color 0.1s;
-  border: none; border-right: 1px solid var(--pb-pine-line);
-}
-.time-seg:last-child { border-right: none; }
-.time-seg.active { background: var(--pb-understory); color: white; }
 .gjam-map-wrap { flex: 1; position: relative; }
 .gjam-map-wrap #gjam_map { height: 100%; width: 100%; }
 .gjam-legend {
-  position: absolute; bottom: 10px; left: 10px; z-index: 1000;
-  background: rgba(244,247,245,0.95);
-  border: 1px solid var(--pb-pine-line);
-  padding: 7px 10px; min-width: 130px; pointer-events: none;
+  position: absolute; bottom: 12px; left: 12px; z-index: 1000;
+  background: rgba(247,249,246,0.96);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px; min-width: 140px;
+  pointer-events: none;
+  box-shadow: var(--shadow);
 }
-.legend-title { font-family: var(--font-display); font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--pb-understory); display: block; margin-bottom: 4px; }
-.legend-gradient { height: 9px; width: 100%; }
-.legend-labels { display: flex; justify-content: space-between; margin-top: 2px; }
-.legend-labels span { font-family: var(--font-body); font-size: 9px; color: var(--pb-ink-muted); }
+.legend-title { font-family: var(--font); font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mid); display: block; margin-bottom: 5px; }
+.legend-gradient { height: 8px; width: 100%; border-radius: 4px; }
+.legend-labels { display: flex; justify-content: space-between; margin-top: 3px; }
+.legend-labels span { font-family: var(--font); font-size: 9px; color: var(--ink2); }
 
-.dm-outer { height: calc(100vh - 110px); display: flex; flex-direction: column; background: var(--pb-parchment); }
+/* ── Decision-Making tab ── */
+.dm-outer { height: calc(100vh - 106px); display: flex; flex-direction: column; background: var(--linen); }
 .dm-topbar {
-  display: flex; align-items: center; gap: 14px; padding: 8px 14px; flex-shrink: 0;
-  background: var(--pb-linen); border-bottom: 1px solid var(--pb-pine-line);
+  display: flex; align-items: center; gap: 14px; padding: 10px 18px; flex-shrink: 0;
+  background: var(--cream); border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
 .dm-topbar-title {
-  font-family: var(--font-display);
-  font-size: 11px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
-  color: var(--pb-understory); flex: 1;
+  font-family: var(--font);
+  font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--ink); flex: 1;
 }
-.dm-loc-text { font-family: var(--font-body); font-size: 10px; color: var(--pb-ink-muted); }
+.dm-loc-text { font-family: var(--font); font-size: 10px; color: var(--ink2); }
 .dm-time-controls { display: flex; align-items: center; gap: 10px; }
 
 .dm-main { flex: 1; display: flex; min-height: 0; overflow: hidden; }
 
+/* Left panel — species list */
 .dm-left {
   width: 220px; min-width: 220px;
-  background: var(--pb-canopy);
-  border-right: 2px solid #0C1C16;
+  background: var(--canopy);
+  border-right: 1px solid rgba(0,0,0,0.2);
   display: flex; flex-direction: column; overflow: hidden;
 }
 .dm-left-section {
-  padding: 12px 12px 10px;
-  border-bottom: 1px solid rgba(0,0,0,0.25);
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
   flex-shrink: 0;
 }
 .dm-section-label {
-  font-family: var(--font-display);
-  font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
-  color: var(--pb-sage); display: block; margin-bottom: 8px;
+  font-family: var(--font);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--sage); display: block;
 }
 .dm-species-scroll { flex: 1; overflow-y: auto; }
 .dm-sp-row {
-  display: flex; align-items: center; gap: 6px;
-  padding: 7px 12px;
-  border-bottom: 1px solid rgba(0,0,0,0.15);
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
   cursor: pointer; transition: background 0.1s;
 }
-.dm-sp-row:hover { background: rgba(255,255,255,0.06); }
-.dm-sp-row.selected { background: rgba(61,107,80,0.6); border-left: 3px solid var(--pb-sage); padding-left: 9px; }
-.dm-sp-rank { font-family: var(--font-body); font-size: 9px; font-weight: 700; color: var(--pb-sage); width: 16px; flex-shrink: 0; }
-.dm-sp-name { font-family: var(--font-body); font-style: italic; font-size: 11px; color: var(--pb-mist); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dm-sp-row:hover { background: rgba(255,255,255,0.07); }
+.dm-sp-row.selected {
+  background: rgba(58,138,90,0.25);
+  border-left: 3px solid var(--sage);
+  padding-left: 11px;
+}
+.dm-sp-rank { font-family: var(--font); font-size: 9px; font-weight: 600; color: var(--sage); width: 16px; flex-shrink: 0; }
+.dm-sp-name { font-family: var(--font); font-style: italic; font-size: 11px; color: var(--mist); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dm-sp-row.selected .dm-sp-name { color: white; }
-.dm-sp-score { font-family: var(--font-body); font-size: 10px; font-weight: 700; color: var(--pb-sage); }
+.dm-sp-score { font-family: var(--font); font-size: 10px; font-weight: 600; color: var(--sage); }
 .dm-sp-row.selected .dm-sp-score { color: #A8D8C0; }
-.dm-no-data { padding: 20px 12px; font-family: var(--font-body); font-size: 11px; color: var(--pb-sage); text-align: center; }
+.dm-no-data { padding: 24px 14px; font-family: var(--font); font-size: 11px; color: var(--sage); text-align: center; line-height: 1.5; }
 
+/* Center panel — score breakdown */
 .dm-center {
   flex: 1; min-width: 0; display: flex; flex-direction: column;
-  border-right: 1px solid var(--pb-pine-line);
-  background: var(--pb-parchment);
-  overflow: hidden;
+  background: var(--cream); overflow: hidden;
 }
 .dm-panel-header {
-  padding: 9px 14px; flex-shrink: 0;
-  background: var(--pb-linen); border-bottom: 1px solid var(--pb-pine-line);
+  padding: 10px 16px; flex-shrink: 0;
+  background: var(--linen); border-bottom: 1px solid var(--border);
   display: flex; align-items: baseline; gap: 10px;
 }
 .dm-panel-title {
-  font-family: var(--font-display);
-  font-size: 10px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase;
-  color: var(--pb-understory);
+  font-family: var(--font);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--mid);
 }
-.dm-panel-subtitle { font-family: var(--font-body); font-size: 10px; color: var(--pb-ink-muted); }
-.dm-panel-body { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+.dm-panel-subtitle { font-family: var(--font); font-size: 11px; font-style: italic; color: var(--ink2); }
+.dm-panel-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
 
-.dm-metric-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-.dm-metric-card {
+/* Score cards — 3 components + composite */
+.dm-score-layout { display: flex; flex-direction: column; gap: 10px; }
+
+/* Composite score — prominent pill */
+.dm-composite-card {
+  background: linear-gradient(135deg, var(--comp-c), #0F4A27);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  display: flex; align-items: center; justify-content: space-between;
+  box-shadow: var(--shadow);
+}
+.dm-composite-label {
+  font-family: var(--font); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: rgba(255,255,255,0.7);
+}
+.dm-composite-val {
+  font-family: var(--font); font-size: 36px; font-weight: 700;
+  color: white; line-height: 1; letter-spacing: -0.02em;
+}
+.dm-composite-sub {
+  font-family: var(--font); font-size: 9px; color: rgba(255,255,255,0.55); margin-top: 2px;
+}
+
+/* Three component cards */
+.dm-component-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.dm-comp-card {
   background: white;
-  border: 1px solid var(--pb-pine-line);
-  border-top: 3px solid var(--pb-pine-line);
-  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+  position: relative; overflow: hidden;
 }
-.dm-metric-card.gjam-card  { border-top-color: var(--pb-gjam); }
-.dm-metric-card.wild-card  { border-top-color: var(--pb-wildlife); }
-.dm-metric-card.timb-card  { border-top-color: var(--pb-timber); }
-.dm-metric-card.total-card { border-top-color: var(--pb-accent-hi); }
-.dm-metric-label { font-family: var(--font-display); font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--pb-ink-muted); display: block; margin-bottom: 4px; }
-.dm-metric-val { font-family: var(--font-body); font-size: 22px; font-weight: 700; color: var(--pb-ink); line-height: 1; }
-.dm-metric-card.gjam-card  .dm-metric-val { color: var(--pb-gjam); }
-.dm-metric-card.wild-card  .dm-metric-val { color: var(--pb-wildlife); }
-.dm-metric-card.timb-card  .dm-metric-val { color: var(--pb-timber); }
-.dm-metric-card.total-card .dm-metric-val { color: var(--pb-accent-hi); }
-.dm-metric-raw { font-family: var(--font-body); font-size: 10px; color: var(--pb-ink-muted); margin-top: 2px; }
+.dm-comp-card::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 3px;
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.dm-comp-card.gjam-card::before  { background: var(--gjam-c); }
+.dm-comp-card.wild-card::before  { background: var(--wild-c); }
+.dm-comp-card.timb-card::before  { background: var(--timb-c); }
+.dm-comp-label {
+  font-family: var(--font); font-size: 9px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink2);
+  display: block; margin-bottom: 6px;
+}
+.dm-comp-val {
+  font-family: var(--font); font-size: 26px; font-weight: 700;
+  color: var(--ink); line-height: 1;
+}
+.dm-comp-card.gjam-card  .dm-comp-val { color: var(--gjam-c); }
+.dm-comp-card.wild-card  .dm-comp-val { color: var(--wild-c); }
+.dm-comp-card.timb-card  .dm-comp-val { color: var(--timb-c); }
+.dm-comp-raw { font-family: var(--font); font-size: 9px; color: var(--ink2); margin-top: 4px; line-height: 1.3; }
 
+/* Genus-average badge */
+.genus-avg-badge {
+  display: inline-block;
+  font-family: var(--font); font-size: 8px; font-weight: 600;
+  background: #FEF3C7; color: #92400E;
+  border: 1px solid #F59E0B;
+  border-radius: 8px; padding: 1px 6px; margin-top: 4px;
+}
+
+/* Bar charts */
 .dm-chart-block {
   background: white;
-  border: 1px solid var(--pb-pine-line);
-  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
 }
 .dm-chart-label {
-  font-family: var(--font-display);
-  font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--pb-understory); display: block; margin-bottom: 8px;
+  font-family: var(--font);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--mid); display: block; margin-bottom: 10px;
 }
-.bar-row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .bar-row:last-child { margin-bottom: 0; }
-.bar-sp-name { font-family: var(--font-body); font-style: italic; font-size: 10px; color: var(--pb-ink); width: 110px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.bar-track { flex: 1; height: 12px; background: var(--pb-linen); overflow: hidden; border: 1px solid var(--pb-pine-line); }
-.bar-fill { height: 100%; transition: width 0.25s; }
-.bar-val { font-family: var(--font-body); font-size: 9px; font-weight: 700; color: var(--pb-ink-muted); width: 34px; flex-shrink: 0; text-align: right; }
-.bar-row.hl .bar-sp-name { color: var(--pb-accent-hi); font-weight: 700; }
-.bar-row.hl .bar-val { color: var(--pb-accent-hi); }
+.bar-sp-name { font-family: var(--font); font-style: italic; font-size: 10px; color: var(--ink); width: 120px; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-track { flex: 1; height: 10px; background: var(--linen); overflow: hidden; border-radius: 5px; }
+.bar-fill { height: 100%; border-radius: 5px; transition: width 0.3s ease; }
+.bar-val { font-family: var(--font); font-size: 9px; font-weight: 600; color: var(--ink2); width: 36px; flex-shrink: 0; text-align: right; }
+.bar-row.hl .bar-sp-name { color: var(--comp-c); font-weight: 600; }
+.bar-row.hl .bar-val { color: var(--comp-c); }
 
-.dm-right {
-  width: 230px; min-width: 230px;
-  background: var(--pb-parchment);
-  display: flex; flex-direction: column; overflow: hidden;
-}
-.dm-right-body { flex: 1; overflow-y: auto; padding: 12px 12px; display: flex; flex-direction: column; gap: 10px; }
-.subscore-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.subscore-card {
-  background: white;
-  border: 1px solid var(--pb-pine-line);
-  padding: 9px 10px;
-}
-.subscore-name { font-family: var(--font-display); font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--pb-wildlife); display: block; margin-bottom: 3px; }
-.subscore-val { font-family: var(--font-body); font-size: 20px; font-weight: 700; color: var(--pb-ink); line-height: 1; }
-.subscore-denom { font-family: var(--font-body); font-size: 10px; color: var(--pb-ink-muted); }
-.subscore-desc { font-family: var(--font-body); font-size: 9px; color: var(--pb-ink-muted); margin-top: 3px; display: block; line-height: 1.3; }
-.pest-alert {
-  background: var(--pb-danger);
-  padding: 8px 10px; margin-top: 2px;
-}
-.pest-alert b { display: block; font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; color: #FFD0D0; margin-bottom: 3px; }
-.pest-alert p { margin: 0; font-family: var(--font-body); font-size: 9px; color: #FFD0D0; line-height: 1.4; }
-
-.riparian-info {
-  background: white;
-  border: 1px solid var(--pb-pine-line);
-  border-left: 3px solid var(--pb-riparian);
-  padding: 9px 10px;
-}
-.riparian-info b {
-  display: block; font-family: var(--font-display); font-size: 9px; font-weight: 700;
-  letter-spacing: 0.07em; text-transform: uppercase; color: var(--pb-riparian); margin-bottom: 4px;
-}
-.riparian-info p { margin: 0; font-family: var(--font-body); font-size: 10px; color: var(--pb-ink); line-height: 1.4; }
-.riparian-info .ripar-no { color: var(--pb-ink-muted); font-style: italic; }
-
-.about-outer { height: calc(100vh - 110px); background: var(--pb-parchment); overflow-y: auto; }
-.about-inner { max-width: 980px; margin: 0 auto; padding: 0 0 64px; }
-
+/* ── About tab ── */
+.about-outer { height: calc(100vh - 106px); background: var(--cream); overflow-y: auto; }
 .about-hero {
-  background: var(--pb-forest);
-  padding: 44px 32px; text-align: center;
-  border-bottom: 2px solid #0E1F18;
+  background: linear-gradient(135deg, #0F2218, var(--canopy));
+  padding: 48px 40px; text-align: center;
+  border-bottom: 1px solid rgba(0,0,0,0.15);
 }
-.about-heading {
-  font-family: var(--font-display); font-size: 32px; font-weight: 700;
-  color: #E8F5EC; margin: 0 0 8px 0;
-}
-.about-subheading {
-  font-family: var(--font-body); font-size: 13px; color: var(--pb-mist);
-  margin: 0 auto; max-width: 600px; line-height: 1.6;
-}
+.about-heading { font-family: var(--font); font-size: 30px; font-weight: 700; color: #E8F5EC; margin: 0 0 8px 0; }
+.about-subheading { font-family: var(--font); font-size: 14px; color: var(--mist); margin: 0 auto; max-width: 600px; line-height: 1.6; font-weight: 300; }
 
-.about-section { padding: 32px 32px 0; }
-.about-section-label {
-  font-family: var(--font-display); font-size: 10px; font-weight: 700;
-  letter-spacing: 0.1em; text-transform: uppercase; color: var(--pb-understory);
-  margin: 0 0 14px 0; display: block;
-}
+.about-inner { max-width: 780px; margin: 0 auto; padding: 40px 24px 64px; }
 
-.about-stat-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 32px; }
-.about-stat-tile {
-  background: white; border: 1px solid var(--pb-pine-line);
-  border-top: 3px solid var(--pb-pine-line);
-  padding: 14px 16px;
+/* Person card: image left, text right */
+.about-person {
+  display: flex; align-items: flex-start; gap: 24px;
+  padding: 28px 0;
+  border-bottom: 1px solid var(--border);
 }
-.about-stat-tile.gjam-tile  { border-top-color: var(--pb-gjam); }
-.about-stat-tile.wild-tile  { border-top-color: var(--pb-wildlife); }
-.about-stat-tile.timb-tile  { border-top-color: var(--pb-timber); }
-.about-stat-val {
-  font-family: var(--font-body); font-size: 20px; font-weight: 700; color: var(--pb-ink); line-height: 1;
-}
-.about-stat-label {
-  font-family: var(--font-display); font-size: 9px; font-weight: 700;
-  letter-spacing: 0.08em; text-transform: uppercase; color: var(--pb-ink-muted);
-  margin-top: 4px; display: block;
-}
-
-.about-team-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; padding-bottom: 8px; }
-.about-card {
-  background: white; border: 1px solid var(--pb-pine-line);
-  border-top: 3px solid var(--pb-pine-line);
-  padding: 20px 18px; text-align: center;
-}
-.about-card.card-a { border-top-color: var(--pb-gjam); }
-.about-card.card-b { border-top-color: var(--pb-wildlife); }
-.about-card.card-c { border-top-color: var(--pb-timber); }
+.about-person:last-child { border-bottom: none; }
 .about-photo {
-  width: 110px; height: 110px; border-radius: 50%;
-  object-fit: cover; margin: 0 auto 14px;
-  border: 3px solid var(--pb-linen); display: block;
+  width: 96px; height: 96px; border-radius: 50%;
+  object-fit: cover; flex-shrink: 0;
+  border: 3px solid var(--border);
+  box-shadow: var(--shadow);
 }
-.about-name {
-  font-family: var(--font-display); font-size: 15px; font-weight: 700;
-  color: var(--pb-forest); margin: 0 0 2px 0;
-}
+.about-person-info { flex: 1; }
+.about-name { font-family: var(--font); font-size: 16px; font-weight: 600; color: var(--ink); margin: 0 0 2px 0; }
 .about-role {
-  font-family: var(--font-body); font-size: 10px; font-weight: 700;
-  letter-spacing: 0.06em; text-transform: uppercase; color: var(--pb-understory);
+  font-family: var(--font); font-size: 9px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--mid);
   margin: 0 0 10px 0;
 }
-.about-bio {
-  font-family: var(--font-body); font-size: 11.5px; color: var(--pb-ink-muted);
-  line-height: 1.55; text-align: left;
-}
+.about-bio { font-family: var(--font); font-size: 12px; color: var(--ink2); line-height: 1.6; margin: 0; }
 
-.no-data-msg { padding: 24px 14px; text-align: center; color: var(--pb-ink-muted); font-family: var(--font-body); font-size: 12px; }
+/* Misc */
+.no-data-msg { padding: 24px 14px; text-align: center; color: var(--ink2); font-family: var(--font); font-size: 12px; }
 .container-fluid { padding: 0 !important; }
 .row { margin: 0 !important; }
+.dm-species-scroll::-webkit-scrollbar,
+.gjam-species-list::-webkit-scrollbar { width: 4px; }
+.dm-species-scroll::-webkit-scrollbar-track,
+.gjam-species-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
+.dm-species-scroll::-webkit-scrollbar-thumb,
+.gjam-species-list::-webkit-scrollbar-thumb { background: var(--sage); border-radius: 2px; }
 
-.dm-left ::-webkit-scrollbar, .gjam-species-list::-webkit-scrollbar { width: 5px; }
-.dm-left ::-webkit-scrollbar-track, .gjam-species-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
-.dm-left ::-webkit-scrollbar-thumb, .gjam-species-list::-webkit-scrollbar-thumb { background: var(--pb-sage); }
+.riparian-info {
+  background: white; border-radius: var(--radius);
+  border: 1px solid var(--border); border-left: 3px solid var(--rip);
+  padding: 10px 12px;
+}
+.riparian-info b {
+  display: block; font-family: var(--font); font-size: 9px; font-weight: 600;
+  letter-spacing: 0.07em; text-transform: uppercase; color: var(--rip); margin-bottom: 4px;
+}
+.riparian-info p { margin: 0; font-family: var(--font); font-size: 10px; color: var(--ink); line-height: 1.4; }
+.riparian-info .ripar-no { color: var(--ink2); font-style: italic; }
+
+.pest-alert {
+  background: linear-gradient(135deg, #7F1D1D, #991B1B);
+  border-radius: var(--radius);
+  padding: 10px 12px; margin-top: 2px;
+  box-shadow: var(--shadow);
+}
+.pest-alert b { display: block; font-family: var(--font); font-size: 9px; font-weight: 600; letter-spacing: 0.06em; color: #FCA5A5; margin-bottom: 4px; }
+.pest-alert p { margin: 0; font-family: var(--font); font-size: 9px; color: #FCA5A5; line-height: 1.4; }
 "
 
 score_color_css <- function(norm_val, type="composite") {
-  if (is.na(norm_val)) return("#C8CCC8")
-  if (type == "gjam")     return(sprintf("rgba(31,111,204,%.2f)",  0.3 + norm_val*0.7))
-  if (type == "wildlife") return(sprintf("rgba(212,59,59,%.2f)",   0.3 + norm_val*0.7))
-  if (type == "timber")   return(sprintf("rgba(217,163,0,%.2f)",   0.3 + norm_val*0.7))
-  if (norm_val >= 0.75) return("#2E7D4A")
-  if (norm_val >= 0.5)  return("#3A8A5A")
-  if (norm_val >= 0.25) return("#5AAA72")
-  return("#8AC888")
+  if (is.na(norm_val)) return("#D1D9D4")
+  if (type == "gjam")     return(sprintf("rgba(37,99,235,%.2f)",   0.35 + norm_val*0.65))
+  if (type == "wildlife") return(sprintf("rgba(180,83,9,%.2f)",    0.35 + norm_val*0.65))
+  if (type == "timber")   return(sprintf("rgba(14,116,144,%.2f)",  0.35 + norm_val*0.65))
+  if (norm_val >= 0.75) return("#166534")
+  if (norm_val >= 0.5)  return("#15803D")
+  if (norm_val >= 0.25) return("#16A34A")
+  return("#4ADE80")
 }
 
 TIE_TOLERANCE <- 0.05
 
-# riparian_mode: 0 = disregard, 1 = tie-breaker, 2 = required.
-# Mode 0 returns scores and keys unchanged.
-# Mode 1 keeps every species but re-sorts so that within any cluster of
-#   near-tied scores (all within TIE_TOLERANCE of each other), riparian-
-#   recommended species come first. Scores themselves are never altered --
-#   only the sort order changes, so the displayed score is always real.
-# Mode 2 drops every non-riparian species from the candidate list before
-#   scoring, so only riparian-recommended species ever appear.
 apply_riparian_mode <- function(df, riparian_mode) {
   if (is.null(riparian_mode) || riparian_mode == 0) return(df)
-  
   is_riparian <- wildlife_data$riparian_recommended[match(df$key, wildlife_data$ba_code)]
   is_riparian <- ifelse(is.na(is_riparian), FALSE, is_riparian)
   df$is_riparian <- is_riparian
-  
-  if (riparian_mode == 2) {
-    return(df[is_riparian, , drop = FALSE])
-  }
-  
+  if (riparian_mode == 2) return(df[is_riparian, , drop = FALSE])
   ord <- order(-df$score, !df$is_riparian, na.last = TRUE)
   df  <- df[ord, , drop = FALSE]
   if (nrow(df) > 1 && !is.na(df$score[1])) {
@@ -862,12 +945,13 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
   ),
   
   div(class="app-header",
-      div(class="header-logo", tags$img(src="logo.png", alt="PBGJAM")),
+      div(class="header-left",
+          div(class="header-logo", tags$img(src="logo.png", alt="PBGJAM")),
+          div(class="header-title", "PBGJAM v2: Decision Making Tool")
+      ),
       div(class="header-sponsors",
-          tags$img(src="duke.png", alt="Duke"),
-          tags$img(src="nasa.png", alt="NASA", class="nasa-logo"),
-          tags$img(src="neon.png", alt="NEON"),
-          tags$img(src="nsf.png",  alt="NSF"))
+          tags$img(src="duke.svg", alt="Duke"),
+          tags$img(src="nasa.png", alt="NASA", class="nasa-logo"))
   ),
   
   tabsetPanel(id="main_tabs",
@@ -890,9 +974,9 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
                            div(class="sidebar-col",
                                tags$span(class="sidebar-section-label", "Model Weights"),
                                div(class="weight-group",
-                                   div(class="weight-label", "GJAM Climate Score"),
+                                   div(class="weight-label", "GJAM Score"),
                                    sliderInput("w1", NULL, min=0, max=1, value=0.34, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "Predicted BA in plots across US by given timeframe")
+                                   div(class="weight-note", "Predicted BA from GJAM across US by given timeframe")
                                ),
                                div(class="weight-group",
                                    div(class="weight-label", "Wildlife Value"),
@@ -902,20 +986,19 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
                                div(class="weight-group",
                                    div(class="weight-label", "Timber Market Value"),
                                    sliderInput("w3", NULL, min=0, max=1, value=0.33, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "Regional price based on official 2025 timber sales directly with USFS.")
+                                   div(class="weight-note", "Regional price based on official 2025 timber sales with USFS.")
                                ),
                                div(class="riparian-group",
                                    div(class="weight-label", "Riparian Status"),
                                    sliderInput("riparian_mode", NULL, min=0, max=2, value=0, step=1,
-                                               ticks=TRUE, width="100%",
-                                               animate=FALSE),
+                                               ticks=TRUE, width="100%", animate=FALSE),
                                    uiOutput("riparian_mode_note")
                                ),
                                tags$hr(style="border-color:rgba(255,255,255,0.1); margin: 14px 0;"),
-                               tags$span(class="sidebar-section-label", "Climate Period"),
+                               tags$span(class="sidebar-section-label", "Prediction Period"),
                                div(class="time-toggle",
-                                   div(class="time-seg active", `data-val`="2040_2069", "2040-2069"),
-                                   div(class="time-seg",        `data-val`="2070_2099", "2070-2099")
+                                   div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
+                                   div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
                                ),
                                tags$hr(style="border-color:rgba(255,255,255,0.1); margin: 14px 0;"),
                                uiOutput("map_sidebar_info")
@@ -939,26 +1022,22 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
               
               tabPanel("GJAM",
                        div(class="gjam-outer",
-                           
                            div(class="gjam-sidebar",
                                div(class="gjam-sidebar-header",
                                    tags$h4("Species"),
                                    tags$input(id="gjam_search", class="gjam-search",
                                               type="text", placeholder="Filter species...")
                                ),
-                               div(class="gjam-species-list",
-                                   uiOutput("gjam_species_list_ui")
-                               )
+                               div(class="gjam-species-list", uiOutput("gjam_species_list_ui"))
                            ),
-                           
                            div(class="gjam-map-area",
                                div(class="gjam-topbar",
                                    uiOutput("gjam_species_title_ui"),
                                    div(class="time-toggle-wrap",
                                        div(class="time-toggle-label", "Period"),
                                        div(class="time-toggle",
-                                           div(class="time-seg active", `data-val`="2040_2069", "2040-2069"),
-                                           div(class="time-seg",        `data-val`="2070_2099", "2070-2099")
+                                           div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
+                                           div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
                                        )
                                    )
                                ),
@@ -972,57 +1051,40 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
               
               tabPanel("Decision-Making",
                        div(class="dm-outer",
-                           
                            div(class="dm-topbar",
                                div(class="dm-topbar-title", "Species Scoring Dashboard"),
                                uiOutput("dm_loc_label"),
                                div(class="dm-time-controls",
-                                   div(class="time-toggle-label", "Climate period"),
+                                   div(class="time-toggle-label", "Prediction period"),
                                    div(class="time-toggle",
-                                       div(class="time-seg active", `data-val`="2040_2069", "2040-2069"),
-                                       div(class="time-seg",        `data-val`="2070_2099", "2070-2099")
+                                       div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
+                                       div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
                                    )
                                ),
                                uiOutput("dm_region_label")
                            ),
-                           
                            div(class="dm-main",
-                               
                                div(class="dm-left",
                                    div(class="dm-left-section",
                                        tags$span(class="dm-section-label", "Top 10 by composite score")
                                    ),
-                                   div(class="dm-species-scroll",
-                                       uiOutput("dm_species_list")
-                                   )
+                                   div(class="dm-species-scroll", uiOutput("dm_species_list"))
                                ),
-                               
                                div(class="dm-center",
                                    div(class="dm-panel-header",
                                        div(class="dm-panel-title", "Score Breakdown"),
                                        uiOutput("dm_selected_name")
                                    ),
                                    div(class="dm-panel-body",
-                                       uiOutput("dm_metric_cards"),
+                                       uiOutput("dm_score_cards"),
                                        div(class="dm-chart-block",
-                                           tags$span(class="dm-chart-label", "All 10 species, composite score"),
+                                           tags$span(class="dm-chart-label", "All 10 species — composite score"),
                                            uiOutput("dm_composite_bars")
                                        ),
                                        div(class="dm-chart-block",
-                                           tags$span(class="dm-chart-label", "All 10 species, by component"),
+                                           tags$span(class="dm-chart-label", "All 10 species — by component"),
                                            uiOutput("dm_component_bars")
                                        )
-                                   )
-                               ),
-                               
-                               div(class="dm-right",
-                                   div(class="dm-panel-header",
-                                       div(class="dm-panel-title", "Wildlife Detail")
-                                   ),
-                                   div(class="dm-right-body",
-                                       uiOutput("dm_wildlife_subscores"),
-                                       uiOutput("dm_riparian_info"),
-                                       uiOutput("dm_pest_info")
                                    )
                                )
                            )
@@ -1039,80 +1101,51 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
                                )
                            ),
                            div(class="about-inner",
-                               div(class="about-section",
-                                   tags$span(class="about-section-label", "What the model scores"),
-                                   div(class="about-stat-row",
-                                       div(class="about-stat-tile gjam-tile",
-                                           div(class="about-stat-val", "GJAM"),
-                                           div(class="about-stat-label", "Predicted climate suitability")
-                                       ),
-                                       div(class="about-stat-tile wild-tile",
-                                           div(class="about-stat-val", "Wildlife"),
-                                           div(class="about-stat-label", "Fruit, insects, pollinators, deer")
-                                       ),
-                                       div(class="about-stat-tile timb-tile",
-                                           div(class="about-stat-val", "Timber"),
-                                           div(class="about-stat-label", "Regional USFS market value")
-                                       )
+                               div(class="about-person",
+                                   tags$img(class="about-photo", src="tatecommission.png", alt="Tate Commission"),
+                                   div(class="about-person-info",
+                                       div(class="about-name", "Tate Commission"),
+                                       div(class="about-role", "Lead Developer"),
+                                       tags$p(class="about-bio",
+                                              "Tate Commission is a sophomore at Duke University studying Statistical Science. His interests include creaeting beautiful data visualizations, developing statistical simulations to understand complex systems, and building deep learning for satellite imagery analysis. He has extensive experience developing interactive tools for large-scale geospatial analysis through R and R Shiny. His work has supported projects with American Forests, NASA, and the African Parks Foundation including through the Qiu Lab at Duke University.")
                                    )
                                ),
-                               div(class="about-section",
-                                   tags$span(class="about-section-label", "Team"),
-                                   div(class="about-team-grid",
-                                       div(class="about-card card-a",
-                                           tags$img(class="about-photo", src="tatecommission.png", alt="Tate Commission"),
-                                           div(class="about-name", "Tate Commission"),
-                                           div(class="about-role", "Lead Developer"),
-                                           div(class="about-bio",
-                                               "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod ",
-                                               "tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim ",
-                                               "veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea ",
-                                               "commodo consequat."
-                                           )
-                                       ),
-                                       div(class="about-card card-b",
-                                           tags$img(class="about-photo", src="tongqiu.png", alt="Dr. Tong Qiu"),
-                                           div(class="about-name", "Dr. Tong Qiu"),
-                                           div(class="about-role", "Faculty Advisor"),
-                                           div(class="about-bio",
-                                               "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum ",
-                                               "dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non ",
-                                               "proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
-                                           )
-                                       ),
-                                       div(class="about-card card-c",
-                                           tags$img(class="about-photo", src="jamesclark.png", alt="Dr. James Clark"),
-                                           div(class="about-name", "Dr. James Clark"),
-                                           div(class="about-role", "Faculty Advisor"),
-                                           div(class="about-bio",
-                                               "Sed ut perspiciatis unde omnis iste natus error sit voluptatem ",
-                                               "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ",
-                                               "ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt."
-                                           )
-                                       )
+                               div(class="about-person",
+                                   tags$img(class="about-photo", src="tongqiu.png", alt="Dr. Tong Qiu"),
+                                   div(class="about-person-info",
+                                       div(class="about-name", "Dr. Tong Qiu"),
+                                       div(class="about-role", "Faculty Advisor"),
+                                       tags$p(class="about-bio",
+                                              "Dr. Tong Qiu is an Assistant Professor of Ecology at Duke University. He is interested in understanding the causes and consequences of biodiversity change at scales ranging from individual organisms to the entire biosphere. As the Principal Investigator of the Qiu lab, Qiu develops data-model synthesis frameworks that integrate remote sensing (e.g., LiDAR, hyperspectral imaging), field sampling, and ecological monitoring networks with Bayesian hierarchical models and Earth System models.")
+                                   )
+                               ),
+                               div(class="about-person",
+                                   tags$img(class="about-photo", src="jamesclark.png", alt="Dr. James Clark"),
+                                   div(class="about-person-info",
+                                       div(class="about-name", "Dr. James Clark"),
+                                       div(class="about-role", "Faculty Advisor"),
+                                       tags$p(class="about-bio",
+                                              "Dr. James Clark is the Nicholas Distinguished Professor of Environmental Science at Duke University and a Fellow of the Ecological Society of America. Clark’s lab uses using long-term experiments and monitoring studies to understand disturbance and climate controls on ecosystem dynamics. He has has authored more than 250 refereed scientific articles and published four books, and he pioneered of the GJAM framework that serves as the backbone of this application.")
                                    )
                                )
                            )
                        )
               )
-              
   )
 )
 
 server <- function(input, output, session) {
   
   rv <- reactiveValues(
-    click_lng       = NULL,
-    click_lat       = NULL,
-    time_range      = "2040_2069",
-    gjam_raster     = NULL,
-    gjam_fallback   = FALSE,
-    usfs_region     = NULL
+    click_lng     = NULL,
+    click_lat     = NULL,
+    time_range    = "2040_2069",
+    gjam_raster   = NULL,
+    gjam_fallback = FALSE,
+    usfs_region   = NULL
   )
   
-  observeEvent(input$time_range, {
-    rv$time_range <- input$time_range
-  })
+  observeEvent(input$time_range, { rv$time_range <- input$time_range })
   
   output$riparian_mode_note <- renderUI({
     mode <- if (is.null(input$riparian_mode)) 0 else input$riparian_mode
@@ -1128,12 +1161,12 @@ server <- function(input, output, session) {
   composite_scores <- reactive({
     if (is.null(rv$click_lng)) return(NULL)
     all_sp <- tryCatch(get_all_species(rv$click_lng, rv$click_lat), error=function(e) NULL)
-    if (is.null(all_sp)) return(NULL)
+    if (is.null(all_sp) || nrow(all_sp) == 0) return(NULL)
     keys <- all_sp$key
     
-    gjam_result    <- get_gjam_vals(rv$click_lng, rv$click_lat, keys, rv$time_range)
-    gjam_raw       <- gjam_result$values
-    gjam_n         <- norm_global(gjam_raw, gjam_range)
+    gjam_result        <- get_gjam_vals(rv$click_lng, rv$click_lat, keys, rv$time_range)
+    gjam_raw           <- gjam_result$values
+    gjam_n             <- norm_global(gjam_raw, gjam_range)
     gjam_fallback_keys <- gjam_result$fallback_keys
     
     wild_raw  <- wildlife_data$wildlife_value_index[match(keys, wildlife_data$ba_code)]
@@ -1145,17 +1178,17 @@ server <- function(input, output, session) {
     composite <- weighted_composite_full(gjam_n, wild_n, timber_n, input$w1, input$w2, input$w3)
     
     df <- data.frame(
-      key            = keys,
-      display_name   = all_sp$display_name,
-      gjam           = round(gjam_n, 4),
-      wildlife       = round(wild_n, 4),
-      timber         = round(timber_n, 4),
-      score          = round(composite$score, 4),
-      n_components   = composite$n_components,
-      timber_raw     = round(timber_prices, 2),
-      wildlife_raw   = round(wild_raw, 1),
+      key               = keys,
+      display_name      = all_sp$display_name,
+      gjam              = round(gjam_n, 4),
+      wildlife          = round(wild_n, 4),
+      timber            = round(timber_n, 4),
+      score             = round(composite$score, 4),
+      n_components      = composite$n_components,
+      timber_raw        = round(timber_prices, 2),
+      wildlife_raw      = round(wild_raw, 1),
       gjam_is_genus_avg = keys %in% gjam_fallback_keys,
-      stringsAsFactors = FALSE
+      stringsAsFactors  = FALSE
     )
     df <- df[order(df$score, decreasing=TRUE, na.last=TRUE), ]
     apply_riparian_mode(df, input$riparian_mode)
@@ -1182,7 +1215,7 @@ server <- function(input, output, session) {
           var lat=e.latlng.lat, lng=e.latlng.lng;
           if (lat<24||lat>50||lng<-125||lng>-66) {
             L.popup().setLatLng(e.latlng)
-              .setContent('<span style=\\'font-family:Arial;font-size:12px;color:#555;\\'>Select a location within the contiguous United States.</span>')
+              .setContent('<span style=\\'font-family:Lexend,sans-serif;font-size:12px;color:#555;\\'>Select a location within the contiguous United States.</span>')
               .openOn(this);
           }
         });
@@ -1223,23 +1256,23 @@ server <- function(input, output, session) {
   
   output$map_sidebar_info <- renderUI({
     if (is.null(rv$click_lat)) return(
-      div(style="color:var(--pb-sage); font-family:var(--font-body); font-size:11px;",
-          "Click the map to select a site. The top 10 species by composite score will appear in the Decision-Making tab.")
+      div(style="color:var(--sage); font-family:var(--font); font-size:11px; line-height:1.5;",
+          "Click the map to select a site. Top 10 species by composite score appear in the Decision-Making tab.")
     )
     df <- top10_scored()
     if (is.null(df)) return(NULL)
     div(
       tags$span(class="sidebar-section-label", style="margin-top:0;", "Top species at site"),
-      tagList(lapply(seq_len(min(5,nrow(df))), function(i) {
+      tagList(lapply(seq_len(min(5, nrow(df))), function(i) {
         row <- df[i,]
         wd  <- wildlife_data[wildlife_data$ba_code == row$key, ]
         is_riparian <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
-        div(style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.08);",
-            div(style="font-family:var(--font-body);font-size:9px;font-weight:700;color:var(--pb-sage);width:14px;", i),
-            div(style="font-family:var(--font-body);font-style:italic;font-size:11px;color:var(--pb-mist);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;",
+        div(style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.07);",
+            div(style="font-family:var(--font);font-size:9px;font-weight:600;color:var(--sage);width:14px;", i),
+            div(style="font-family:var(--font);font-style:italic;font-size:11px;color:var(--mist);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;",
                 row$display_name,
                 if (is_riparian) tags$span(class="flag-tag flag-riparian", "RP") else NULL),
-            div(style="font-family:var(--font-body);font-size:10px;font-weight:700;color:var(--pb-accent);", sprintf("%.3f",row$score))
+            div(style="font-family:var(--font);font-size:10px;font-weight:600;color:#6BAE88;", sprintf("%.3f",row$score))
         )
       }))
     )
@@ -1269,9 +1302,8 @@ server <- function(input, output, session) {
     keys_available <- names(all_gjam_display)
     sel <- input$gjam_selected_species
     tagList(lapply(seq_along(all_gjam_display), function(i) {
-      key  <- keys_available[i]
-      nm   <- all_gjam_display[i]
-      cls  <- if (!is.null(sel) && sel == key) "gjam-sp-item active" else "gjam-sp-item"
+      key <- keys_available[i]; nm <- all_gjam_display[i]
+      cls <- if (!is.null(sel) && sel == key) "gjam-sp-item active" else "gjam-sp-item"
       div(class=cls, `data-key`=key, nm)
     }))
   })
@@ -1280,16 +1312,12 @@ server <- function(input, output, session) {
     key <- input$gjam_selected_species
     if (is.null(key) || !key %in% names(species_display))
       return(div(class="gjam-species-title",
-                 style="font-style:normal;color:var(--pb-ink-muted);font-size:11px;",
-                 "Select a species to view its climate projection"))
-    fb_note <- if (isTRUE(rv$gjam_fallback)) {
-      div(class="gjam-fallback-note",
-          "\u26a0 Genus average shown. No direct raster for this species.")
-    } else NULL
-    tagList(
-      div(class="gjam-species-title", species_display[key]),
-      fb_note
-    )
+                 style="font-style:normal;color:var(--ink2);font-size:11px;",
+                 "Select a species to view its predicted BA map"))
+    fb_note <- if (isTRUE(rv$gjam_fallback))
+      div(class="gjam-fallback-note", "\u00f8 genus average")
+    else NULL
+    tagList(div(class="gjam-species-title", species_display[key]), fb_note)
   })
   
   observeEvent(list(input$gjam_selected_species, input$time_range), {
@@ -1305,29 +1333,24 @@ server <- function(input, output, session) {
     lng    <- isolate(rv$click_lng)
     lat    <- isolate(rv$click_lat)
     raster <- isolate(rv$gjam_raster)
-    
-    proxy <- leafletProxy("gjam_map") %>% clearImages() %>% clearMarkers()
-    if (!is.null(lng))
-      proxy <- proxy %>% addMarkers(lng=lng, lat=lat, icon=thumbtack_icon)
+    proxy  <- leafletProxy("gjam_map") %>% clearImages() %>% clearMarkers()
+    if (!is.null(lng)) proxy <- proxy %>% addMarkers(lng=lng, lat=lat, icon=thumbtack_icon)
     if (!is.null(raster)) {
       vals <- safe_vals(raster)
       if (length(vals) > 0) {
         rng <- range(vals)
         pal <- colorNumeric(
-          palette  = c("#FFF8E1","#FFB300","#E65100","#8B0000"),
-          domain   = rng,
-          na.color = "transparent"
+          palette  = c("#EEF4FB","#9DC9E8","#3182BD","#08519C","#08205A"),
+          domain   = rng, na.color = "transparent"
         )
-        proxy <- proxy %>%
-          addRasterImage(raster, colors=pal, opacity=0.8, project=TRUE)
+        proxy <- proxy %>% addRasterImage(raster, colors=pal, opacity=0.75, project=TRUE)
       }
     }
   }
   
   observeEvent(input$main_tabs, {
-    if (identical(input$main_tabs, "GJAM")) {
+    if (identical(input$main_tabs, "GJAM"))
       session$onFlushed(function() { render_gjam_layer() }, once=TRUE)
-    }
   })
   observeEvent(rv$gjam_raster, {
     if (identical(input$main_tabs, "GJAM")) render_gjam_layer()
@@ -1339,9 +1362,9 @@ server <- function(input, output, session) {
     vals <- safe_vals(r); if (length(vals)==0) return(NULL)
     rng <- range(vals)
     tagList(
-      tags$span(class="legend-title", "Predicted basal area"),
+      tags$span(class="legend-title", "Predicted BA (GJAM scale)"),
       div(class="legend-gradient",
-          style="background:linear-gradient(to right,#FFF8E1,#FFB300,#E65100,#8B0000);"),
+          style="background:linear-gradient(to right,#EEF4FB,#9DC9E8,#3182BD,#08519C,#08205A);"),
       div(class="legend-labels",
           tags$span(round(rng[1],2)),
           tags$span(round(rng[2],2)))
@@ -1350,7 +1373,7 @@ server <- function(input, output, session) {
   
   output$dm_loc_label <- renderUI({
     if (is.null(rv$click_lat))
-      div(class="dm-loc-text", "No site selected. Click the map on the Location tab.")
+      div(class="dm-loc-text", "No site selected — click the map on the Location tab.")
     else
       div(class="dm-loc-text", sprintf("%.4f\u00b0N  %.4f\u00b0W", rv$click_lat, abs(rv$click_lng)))
   })
@@ -1358,22 +1381,21 @@ server <- function(input, output, session) {
   output$dm_region_label <- renderUI({
     if (!is.null(rv$usfs_region))
       div(class="dm-loc-text", paste0("USFS ", rv$usfs_region))
-    else
-      NULL
+    else NULL
   })
   
   output$dm_species_list <- renderUI({
     df  <- top10_scored()
     sel <- input$dm_selected_species
     if (is.null(df))
-      return(div(class="dm-no-data", "Select a site on the Location tab to see species rankings here."))
+      return(div(class="dm-no-data", "Select a site on the Location tab to see species rankings."))
     
     items <- lapply(seq_len(nrow(df)), function(i) {
       row <- df[i,]
       cls <- if (!is.null(sel) && identical(row$key, sel)) "dm-sp-row selected" else "dm-sp-row"
       wd  <- wildlife_data[wildlife_data$ba_code == row$key, ]
-      pest_flag     <- nrow(wd) > 0 && isTRUE(wd$has_pest_flag[1])
-      riparian_flag <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
+      pest_flag        <- nrow(wd) > 0 && isTRUE(wd$has_pest_flag[1])
+      riparian_flag    <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
       riparian_mode_on <- !is.null(input$riparian_mode) && input$riparian_mode > 0
       div(class=cls, `data-key`=row$key,
           div(class="dm-sp-rank", i),
@@ -1397,67 +1419,72 @@ server <- function(input, output, session) {
   
   output$dm_selected_name <- renderUI({
     key <- input$dm_selected_species
-    if (is.null(key) || !key %in% names(species_display)) return(div(class="dm-panel-subtitle", "-"))
+    if (is.null(key) || !key %in% names(species_display)) return(div(class="dm-panel-subtitle", "—"))
     div(class="dm-panel-subtitle", species_display[key])
   })
   
-  output$dm_metric_cards <- renderUI({
+  output$dm_score_cards <- renderUI({
     df  <- top10_scored()
     key <- input$dm_selected_species
+    fmt <- function(x) if (is.na(x)) "—" else sprintf("%.3f", x)
+    
     if (is.null(df) || is.null(key)) {
-      return(div(class="dm-metric-row",
-                 div(class="dm-metric-card gjam-card",  div(class="dm-metric-label","GJAM"), div(class="dm-metric-val","-")),
-                 div(class="dm-metric-card wild-card",  div(class="dm-metric-label","Wildlife"), div(class="dm-metric-val","-")),
-                 div(class="dm-metric-card timb-card",  div(class="dm-metric-label","Timber"), div(class="dm-metric-val","-")),
-                 div(class="dm-metric-card total-card", div(class="dm-metric-label","Total"), div(class="dm-metric-val","-"))
+      return(div(class="dm-score-layout",
+                 div(class="dm-composite-card",
+                     div(class="dm-composite-label", "Composite Score"),
+                     div(class="dm-composite-val", "—")),
+                 div(class="dm-component-row",
+                     div(class="dm-comp-card gjam-card",
+                         tags$span(class="dm-comp-label","GJAM Predicted BA"),
+                         div(class="dm-comp-val","—")),
+                     div(class="dm-comp-card wild-card",
+                         tags$span(class="dm-comp-label","Wildlife Value"),
+                         div(class="dm-comp-val","—")),
+                     div(class="dm-comp-card timb-card",
+                         tags$span(class="dm-comp-label","Timber Value"),
+                         div(class="dm-comp-val","—"))
+                 )
       ))
     }
+    
     row <- df[df$key == key, ]
-    if (nrow(row)==0) return(NULL)
-    fmt <- function(x) if (is.na(x)) "-" else sprintf("%.3f", x)
+    if (nrow(row) == 0) return(NULL)
+    
     mode <- if (is.null(input$riparian_mode)) 0 else input$riparian_mode
-    riparian_note <- if (mode > 0) {
-      wd <- wildlife_data[wildlife_data$ba_code == key, ]
-      is_rip <- nrow(wd) > 0 && isTRUE(wd$riparian_recommended[1])
-      if (mode == 2) {
-        "riparian-required mode: only recommended species shown"
-      } else if (is_rip) {
-        "riparian species: favored among near-tied scores"
-      } else {
-        "not riparian-recommended"
-      }
-    } else NULL
-    div(class="dm-metric-row",
-        div(class="dm-metric-card gjam-card",
-            div(class="dm-metric-label", "GJAM"),
-            div(class="dm-metric-val", fmt(row$gjam[1])),
-            div(class="dm-metric-raw",
-                if (isTRUE(row$gjam_is_genus_avg[1]))
-                  "genus average (no direct data for this species)"
-                else
-                  "climate suitability (normalized)")
+    comp_sub <- if (mode == 2) {
+      "riparian-required mode"
+    } else if (!is.na(row$n_components[1]) && row$n_components[1] < 3) {
+      paste0("based on ", row$n_components[1], " of 3 components")
+    } else "weighted composite of 3 components"
+    
+    gjam_raw_note <- if (isTRUE(row$gjam_is_genus_avg[1])) {
+      div(class="genus-avg-badge", "\u00f8 genus-level average")
+    } else div(class="dm-comp-raw", "direct GJAM prediction")
+    
+    div(class="dm-score-layout",
+        div(class="dm-composite-card",
+            div(div(class="dm-composite-label", "Composite Score"),
+                div(class="dm-composite-sub", comp_sub)),
+            div(class="dm-composite-val", fmt(row$score[1]))
         ),
-        div(class="dm-metric-card wild-card",
-            div(class="dm-metric-label", "Wildlife"),
-            div(class="dm-metric-val", fmt(row$wildlife[1])),
-            div(class="dm-metric-raw",
-                if (!is.na(row$wildlife_raw[1])) paste0("raw: ", row$wildlife_raw[1], " / 100") else "no data")
-        ),
-        div(class="dm-metric-card timb-card",
-            div(class="dm-metric-label", "Timber"),
-            div(class="dm-metric-val", fmt(row$timber[1])),
-            div(class="dm-metric-raw",
-                if (!is.na(row$timber_raw[1])) paste0("$", formatC(row$timber_raw[1], format="f", digits=0), "/MBF") else "no price data")
-        ),
-        div(class="dm-metric-card total-card",
-            div(class="dm-metric-label", "Composite"),
-            div(class="dm-metric-val", fmt(row$score[1])),
-            div(class="dm-metric-raw",
-                if (!is.null(riparian_note)) riparian_note
-                else if (!is.na(row$n_components[1]) && row$n_components[1] < 3)
-                  paste0("based on ", row$n_components[1], " of 3 components")
-                else
-                  "based on 3 of 3 components")
+        div(class="dm-component-row",
+            div(class="dm-comp-card gjam-card",
+                tags$span(class="dm-comp-label", "GJAM Predicted BA"),
+                div(class="dm-comp-val", fmt(row$gjam[1])),
+                gjam_raw_note
+            ),
+            div(class="dm-comp-card wild-card",
+                tags$span(class="dm-comp-label", "Wildlife Value"),
+                div(class="dm-comp-val", fmt(row$wildlife[1])),
+                div(class="dm-comp-raw",
+                    if (!is.na(row$wildlife_raw[1])) paste0("raw: ", row$wildlife_raw[1], " / 100") else "no data")
+            ),
+            div(class="dm-comp-card timb-card",
+                tags$span(class="dm-comp-label", "Timber Value"),
+                div(class="dm-comp-val", fmt(row$timber[1])),
+                div(class="dm-comp-raw",
+                    if (!is.na(row$timber_raw[1])) paste0("$", formatC(row$timber_raw[1], format="f", digits=0), "/MBF") else "no price data")
+            )
         )
     )
   })
@@ -1465,7 +1492,7 @@ server <- function(input, output, session) {
   output$dm_composite_bars <- renderUI({
     df  <- top10_scored()
     sel <- input$dm_selected_species
-    if (is.null(df)) return(div(class="no-data-msg", "-"))
+    if (is.null(df)) return(div(class="no-data-msg", "—"))
     tagList(lapply(seq_len(nrow(df)), function(i) {
       row    <- df[i,]
       is_sel <- !is.null(sel) && identical(row$key, sel)
@@ -1475,7 +1502,7 @@ server <- function(input, output, session) {
           div(class="bar-sp-name", row$display_name),
           div(class="bar-track",
               div(class="bar-fill", style=sprintf("width:%.1f%%;background:%s;", pct, col))),
-          div(class="bar-val", if (!is.na(row$score)) sprintf("%.3f",row$score) else "-")
+          div(class="bar-val", if (!is.na(row$score)) sprintf("%.3f",row$score) else "—")
       )
     }))
   })
@@ -1483,130 +1510,35 @@ server <- function(input, output, session) {
   output$dm_component_bars <- renderUI({
     df  <- top10_scored()
     sel <- input$dm_selected_species
-    if (is.null(df)) return(div(class="no-data-msg", "-"))
+    if (is.null(df)) return(div(class="no-data-msg", "—"))
     
-    header <- div(style="display:flex;gap:12px;margin-bottom:6px;",
-                  div(style="width:110px;flex-shrink:0;"),
+    header <- div(style="display:flex;gap:12px;margin-bottom:8px;",
+                  div(style="width:120px;flex-shrink:0;"),
                   div(style="flex:1;display:flex;gap:4px;",
-                      div(style="flex:1;font-family:var(--font-display);font-size:8px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--pb-gjam);text-align:center;","GJAM"),
-                      div(style="flex:1;font-family:var(--font-display);font-size:8px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--pb-wildlife);text-align:center;","Wildlife"),
-                      div(style="flex:1;font-family:var(--font-display);font-size:8px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--pb-timber);text-align:center;","Timber")
+                      div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--gjam-c);text-align:center;","GJAM"),
+                      div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--wild-c);text-align:center;","Wildlife"),
+                      div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--timb-c);text-align:center;","Timber")
                   )
     )
     rows <- lapply(seq_len(nrow(df)), function(i) {
       row    <- df[i,]
       is_sel <- !is.null(sel) && identical(row$key, sel)
-      g_pct  <- if (!is.na(row$gjam))     row$gjam*100     else 0
-      w_pct  <- if (!is.na(row$wildlife))  row$wildlife*100 else 0
-      t_pct  <- if (!is.na(row$timber))   row$timber*100   else 0
-      div(class=if(is_sel) "bar-row hl" else "bar-row",
-          style="align-items:center;",
+      g_pct  <- if (!is.na(row$gjam))    row$gjam*100    else 0
+      w_pct  <- if (!is.na(row$wildlife)) row$wildlife*100 else 0
+      t_pct  <- if (!is.na(row$timber))  row$timber*100  else 0
+      div(class=if(is_sel) "bar-row hl" else "bar-row", style="align-items:center;",
           div(class="bar-sp-name", row$display_name),
           div(style="flex:1;display:flex;gap:4px;",
               div(class="bar-track", style="flex:1;",
-                  div(class="bar-fill", style=sprintf("width:%.1f%%;background:var(--pb-gjam);opacity:0.7;", g_pct))),
+                  div(class="bar-fill", style=sprintf("width:%.1f%%;background:var(--gjam-c);opacity:0.75;", g_pct))),
               div(class="bar-track", style="flex:1;",
-                  div(class="bar-fill", style=sprintf("width:%.1f%%;background:var(--pb-wildlife);opacity:0.7;", w_pct))),
+                  div(class="bar-fill", style=sprintf("width:%.1f%%;background:var(--wild-c);opacity:0.75;", w_pct))),
               div(class="bar-track", style="flex:1;",
-                  div(class="bar-fill", style=sprintf("width:%.1f%%;background:var(--pb-timber);opacity:0.7;", t_pct)))
+                  div(class="bar-fill", style=sprintf("width:%.1f%%;background:var(--timb-c);opacity:0.75;", t_pct)))
           )
       )
     })
     tagList(header, rows)
-  })
-  
-  output$dm_wildlife_subscores <- renderUI({
-    key <- input$dm_selected_species
-    if (is.null(key)) return(div(class="no-data-msg", "Select a species"))
-    wd <- wildlife_data[wildlife_data$ba_code == key, ]
-    if (nrow(wd)==0) return(div(class="no-data-msg", "No wildlife data"))
-    
-    fmt_sub <- function(x) if (is.na(x)) "-" else sprintf("%.1f", x)
-    browse_desc <- switch(
-      tolower(replace_na(wd$palatable_browse_animal[1],"unknown")),
-      "high"   = "High palatability",
-      "medium" = "Moderate value",
-      "low"    = "Low value",
-      "Unknown"
-    )
-    mast_desc <- paste0(
-      replace_na(wd$fruit_seed_abundance[1],"?"), " abundance",
-      if (!is.na(wd$berry_nut_seed_product[1]) && tolower(wd$berry_nut_seed_product[1])=="yes") " - mast producer" else ""
-    )
-    lep_count <- if (!is.na(wd$lep_spp_supported[1])) paste0(wd$lep_spp_supported[1], " Lep spp.") else "No data"
-    bloom_desc <- if (!is.na(wd$bloom_period[1]) && nzchar(wd$bloom_period[1])) wd$bloom_period[1] else "No bloom data"
-    
-    tagList(
-      tags$span(style="font-family:var(--font-display);font-size:9px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--pb-wildlife);display:block;margin-bottom:7px;",
-                "Wildlife subscores"),
-      div(class="subscore-grid",
-          div(class="subscore-card",
-              tags$span(class="subscore-name","Mast / Fruit"),
-              tags$span(class="subscore-val", fmt_sub(wd$cat_A[1])),
-              tags$span(class="subscore-denom"," / 25"),
-              tags$span(class="subscore-desc", mast_desc)
-          ),
-          div(class="subscore-card",
-              tags$span(class="subscore-name","Insect Host"),
-              tags$span(class="subscore-val", fmt_sub(wd$cat_B[1])),
-              tags$span(class="subscore-denom"," / 25"),
-              tags$span(class="subscore-desc", lep_count)
-          ),
-          div(class="subscore-card",
-              tags$span(class="subscore-name","Pollinator"),
-              tags$span(class="subscore-val", fmt_sub(wd$cat_C[1])),
-              tags$span(class="subscore-denom"," / 25"),
-              tags$span(class="subscore-desc", bloom_desc)
-          ),
-          div(class="subscore-card",
-              tags$span(class="subscore-name","Browse / Deer"),
-              tags$span(class="subscore-val", fmt_sub(wd$cat_D[1])),
-              tags$span(class="subscore-denom"," / 25"),
-              tags$span(class="subscore-desc", browse_desc)
-          )
-      )
-    )
-  })
-  
-  output$dm_riparian_info <- renderUI({
-    key <- input$dm_selected_species
-    if (is.null(key)) return(NULL)
-    wd <- wildlife_data[wildlife_data$ba_code == key, ]
-    if (nrow(wd) == 0) return(NULL)
-    
-    is_recommended <- isTRUE(wd$riparian_recommended[1])
-    category       <- wd$riparian_category[1]
-    wettest        <- wd$wetland_wettest[1]
-    
-    if (is_recommended) {
-      div(class="riparian-info",
-          tags$b("Riparian status"),
-          tags$p(
-            if (!is.na(category) && nzchar(category)) category else "Recommended for riparian planting",
-            if (!is.na(wettest) && nzchar(wettest)) paste0(" (wetland indicator: ", wettest, ")") else ""
-          )
-      )
-    } else {
-      div(class="riparian-info",
-          tags$b("Riparian status"),
-          tags$p(class="ripar-no",
-                 if (!is.na(category) && nzchar(category)) category else "Not typically riparian")
-      )
-    }
-  })
-  
-  output$dm_pest_info <- renderUI({
-    key <- input$dm_selected_species
-    if (is.null(key)) return(NULL)
-    wd <- wildlife_data[wildlife_data$ba_code == key, ]
-    if (nrow(wd)==0 || !isTRUE(wd$has_pest_flag[1])) return(NULL)
-    div(class="pest-alert",
-        tags$b("\u26a0  Pest / Pathogen Alert"),
-        tags$p(replace_na(wd$pest_flag_list[1], "No detail available")),
-        if (!is.na(wd$pest_flag_notes[1]) && nzchar(wd$pest_flag_notes[1]))
-          tags$p(style="margin-top:4px;", wd$pest_flag_notes[1])
-        else NULL
-    )
   })
   
 }
