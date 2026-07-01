@@ -377,7 +377,8 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
 }
 .header-sponsors { display: flex; align-items: center; gap: 20px; }
 .header-sponsors img { height: 24px; opacity: 0.7; filter: brightness(0) invert(1); }
-.header-sponsors .nasa-logo { height: 38px; }
+.header-sponsors .nasa-logo { height: 44px; }
+.header-sponsors .pa_dcnr-logo { height: 38px; }
 
 /* ── Tabs ── */
 .nav-tabs {
@@ -457,7 +458,7 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
 }
 .weight-label {
   font-family: var(--font);
-  font-size: 11px; font-weight: 500; color: var(--mist); margin-bottom: 6px;
+  font-size: 11px; font-weight: 500; color: white !important; margin-bottom: 6px;
 }
 .weight-note {
   font-family: var(--font);
@@ -476,7 +477,7 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
   box-shadow: inset 0 1px 3px rgba(0,0,0,0.4);
 }
 .irs--shiny .irs-handle {
-  background: linear-gradient(to bottom, #E8F0EB, #C8D8CC) !important;
+  background: linear-gradient(to bottom, #38A8C8, #0E6888) !important;
   border: 1px solid #8AB09A !important;
   border-radius: 50% !important;
   width: 18px !important; height: 18px !important;
@@ -499,6 +500,17 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
 }
 .riparian-group .irs--shiny .irs-handle {
   border-color: #38A8C8 !important;
+}
+
+.irs--shiny .irs-min,
+.irs--shiny .irs-max {
+  color: white !important;
+  background: rgba(15,34,24,0.95) !important;
+  border: 1px solid rgba(100,180,130,0.25) !important;
+  border-radius: 4px !important;
+  padding: 2px 6px !important;
+  box-shadow: inset 0 1px 2px rgba(0,0,0,0.35) !important;
+  text-shadow: none !important;
 }
 
 .riparian-group {
@@ -940,7 +952,12 @@ function relabelRiparianSlider() {
 }
 $(document).on('shiny:value', function() { setTimeout(relabelRiparianSlider, 50); });
 $(document).on('input change', '#riparian_mode', function() { setTimeout(relabelRiparianSlider, 10); });
-$(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
+
+$(document).ready(function() {
+  setTimeout(relabelRiparianSlider, 300);
+  Shiny.setInputValue('time_range', '2040_2069', {priority:'event'});
+});
+
     "))
   ),
   
@@ -951,7 +968,8 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
       ),
       div(class="header-sponsors",
           tags$img(src="duke.svg", alt="Duke"),
-          tags$img(src="nasa.png", alt="NASA", class="nasa-logo"))
+          tags$img(src="nasa.png", alt="NASA", class="nasa-logo"),
+          tags$img(src="pa_dcnr.png", alt="pa_dcnr", class="pa_dcnr-logo"))
   ),
   
   tabsetPanel(id="main_tabs",
@@ -959,7 +977,7 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
               tabPanel("Home",
                        div(class="welcome-tab",
                            div(class="welcome-panel",
-                               tags$h1(class="welcome-title", "PBGJAM v2.0"),
+                               tags$h1(class="welcome-title", "PBGJAM v2"),
                                tags$p(class="welcome-desc",
                                       "We apply the latest advancements in technology and statistics to ",
                                       "forecast the effects of a changing climate on the abundance and ",
@@ -986,7 +1004,7 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
                                div(class="weight-group",
                                    div(class="weight-label", "Timber Market Value"),
                                    sliderInput("w3", NULL, min=0, max=1, value=0.33, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "Regional price based on official 2025 timber sales with USFS.")
+                                   div(class="weight-note", "Regional price based on official 2025 timber sales with USFS")
                                ),
                                div(class="riparian-group",
                                    div(class="weight-label", "Riparian Status"),
@@ -1052,7 +1070,7 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
               tabPanel("Decision-Making",
                        div(class="dm-outer",
                            div(class="dm-topbar",
-                               div(class="dm-topbar-title", "Species Scoring Dashboard"),
+                               div(class="dm-topbar-title", "Species Scoring"),
                                uiOutput("dm_loc_label"),
                                div(class="dm-time-controls",
                                    div(class="time-toggle-label", "Prediction period"),
@@ -1078,11 +1096,11 @@ $(document).ready(function() { setTimeout(relabelRiparianSlider, 300); });
                                    div(class="dm-panel-body",
                                        uiOutput("dm_score_cards"),
                                        div(class="dm-chart-block",
-                                           tags$span(class="dm-chart-label", "All 10 species — composite score"),
+                                           tags$span(class="dm-chart-label", "By composite score"),
                                            uiOutput("dm_composite_bars")
                                        ),
                                        div(class="dm-chart-block",
-                                           tags$span(class="dm-chart-label", "All 10 species — by component"),
+                                           tags$span(class="dm-chart-label", "By component"),
                                            uiOutput("dm_component_bars")
                                        )
                                    )
@@ -1362,7 +1380,7 @@ server <- function(input, output, session) {
     vals <- safe_vals(r); if (length(vals)==0) return(NULL)
     rng <- range(vals)
     tagList(
-      tags$span(class="legend-title", "Predicted BA (GJAM scale)"),
+      tags$span(class="legend-title", "Predicted basal area (transformed)"),
       div(class="legend-gradient",
           style="background:linear-gradient(to right,#EEF4FB,#9DC9E8,#3182BD,#08519C,#08205A);"),
       div(class="legend-labels",
