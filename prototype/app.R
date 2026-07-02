@@ -11,7 +11,7 @@ load("BA.rdata")
 load("xdata.rdata")
 
 wildlife_data <- read_csv(
-  "~/Documents/PBGJAM-data-explorer/raw_data/v2/BA_wildlife_traits.csv",
+  "BA_wildlife_traits.csv",
   show_col_types = FALSE
 ) |>
   dplyr::select(
@@ -68,7 +68,7 @@ local({
 })
 
 timber <- read_csv(
-  "~/Documents/PBGJAM-data-explorer/USFScut-sold-reports/timber_price_by_gjam_species_wide.csv",
+  "timber_price_by_gjam_species_wide.csv",
   show_col_types = FALSE
 )
 
@@ -135,7 +135,7 @@ haversine_km <- function(lon1, lat1, lon2, lat2) {
   stringsAsFactors = FALSE
 )
 .usfs_regions_sf <- tryCatch(
-  readRDS("~/Documents/PBGJAM-data-explorer/raw_data/v2/usfs_regions.rds"),
+  readRDS("usfs_regions.rds"),
   error = function(e) { message("USFS RDS not found - centroid fallback."); NULL }
 )
 
