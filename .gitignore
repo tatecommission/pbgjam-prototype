@@ -4,8 +4,10 @@
 *.RData
 *.tif
 *.gpkg
+*.rds
 rsconnect/
 *.jpg
 *.png
-www/*.jpg
-www/*.png
+www/
+prototype/BA_wildlife_traits.csv
+prototype/timber_price_by_gjam_species_wide.csv
