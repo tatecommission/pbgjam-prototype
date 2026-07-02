@@ -106,6 +106,10 @@ species_display <- setNames(
   species_names
 )
 
+
+# ── Scoring rasters: SCALED (PredRasScale) ──────────────────────────────────────────
+# Used by gjam_range, get_gjam_vals, Decision-Making composite scores.
+# Must remain on PredRasScale — do NOT change this path.
 .gjam_base <- path.expand(
   "~/Documents/PBGJAM-data-explorer/data4Tate/gjamCreateMap/Trees/PredRasScale/rcp45"
 )
@@ -118,6 +122,46 @@ gjam_files <- lapply(
     setNames(tifs, keys)
   }
 )
+
+# ── Visualization rasters: RAW (PredRas) ───────────────────────────────────────────
+# Used ONLY for map display in the Visualizations tab.
+# Kept separate from gjam_files so scoring is completely unaffected.
+.vis_gjam_base <- path.expand(
+  "~/Documents/PBGJAM-data-explorer/data4Tate/gjamCreateMap/Trees/PredRas/rcp45"
+)
+vis_gjam_files <- lapply(
+  setNames(c("2040_2069","2070_2099"), c("2040_2069","2070_2099")),
+  function(period) {
+    dir  <- file.path(.vis_gjam_base, period)
+    tifs <- list.files(dir, pattern="\\.tif$", full.names=TRUE)
+    keys <- sub(paste0("_",period,"_rcp45\\.tif$"), "", sub("^mean_","",basename(tifs)))
+    setNames(tifs, keys)
+  }
+)
+
+# ── Historical BA rasters — raw (visualization only) ───────────────────────────
+.hist_base <- path.expand(
+  "~/Documents/PBGJAM-data-explorer/data4Tate/gjamCreateMap/Trees/PredRas/hist"
+)
+hist_files <- local({
+  tifs <- list.files(.hist_base, pattern="\\.tif$", full.names=TRUE)
+  if (length(tifs) == 0) {
+    message("Historical BA rasters not found at: ", .hist_base)
+    list()
+  } else {
+    keys <- sub("_hist\\.tif$", "", sub("^mean_", "", basename(tifs)))
+    keys <- sub("\\.tif$", "", keys)
+    setNames(tifs, keys)
+  }
+})
+
+# ── GEE Canopy Height tile URL ─────────────────────────────────────────────────
+# HOW TO REGENERATE (URL expires ~24 hours after generation):
+#   1. Go to https://code.earthengine.google.com with qt email
+#   2. Paste and run initial_chm_script
+#   3. Copy the printed URL (decode %7B/%7D → {z}/{x}/{y}) and paste below.
+#
+canopy_tile_url <- "https://earthengine.googleapis.com/v1/projects/pbgjam-v2/maps/77ab79e36978d8bde0608e8370a50a02-ad7d4b9e68fa58d78c57ba645be8be48/tiles/%7Bz%7D/%7Bx%7D/%7By%7D"
 
 haversine_km <- function(lon1, lat1, lon2, lat2) {
   R <- 6371
@@ -297,31 +341,89 @@ get_gjam_vals <- function(lng, lat, keys, period) {
 
 safe_vals <- function(r) { v <- raster::values(r); v[!is.na(v)&is.finite(v)] }
 
-load_display_raster <- function(fpath, agg_fact=1) {
-  if (is.null(fpath)||is.na(fpath)||!file.exists(fpath)) return(NULL)
-  r <- terra::rast(fpath)
-  if (agg_fact>1) r <- terra::aggregate(r, fact=agg_fact, fun="mean")
-  raster::raster(r)
+# ── Raster cache ──────────────────────────────────────────────────────────────
+# In-memory cache keyed by "future_2040_2069_quealba" etc.
+# On first load: read raw TIF, reproject to WGS84, save as .rds to a session
+# temp dir so the projected version survives server restarts mid-session.
+# On repeat access: load from .rds (fast) or in-memory (instant).
+.raster_cache    <- new.env(hash=TRUE, parent=emptyenv())
+.raster_cache_dir <- local({
+  d <- file.path(tempdir(), "pbgjam_raster_cache")
+  dir.create(d, showWarnings=FALSE, recursive=TRUE)
+  d
+})
+
+# Keep raster in native CRS; addRasterImage(project=TRUE) reprojects correctly.
+# Pre-projecting via terra then wrapping in raster::raster() mis-registers the
+# extent, shifting the layer north and into Canada. Let leaflet handle it.
+.prep_raster <- function(terra_rast) {
+  raster::raster(terra_rast)
 }
 
-load_gjam_raster_for_key <- function(key, period, agg_fact=3) {
-  files <- gjam_files[[period]]
-  if (key %in% names(files) && file.exists(files[[key]]))
-    return(list(raster=load_display_raster(files[[key]], agg_fact), fallback=FALSE))
-  genus_lower <- tolower(regmatches(key, regexpr("^[a-z]+", key)))
-  genus_keys  <- names(files)[startsWith(tolower(names(files)), genus_lower)]
-  genus_keys  <- genus_keys[sapply(genus_keys, function(gk) file.exists(files[[gk]]))]
-  if (length(genus_keys) == 0) return(list(raster=NULL, fallback=TRUE))
-  tryCatch({
-    stack_r <- terra::rast(lapply(genus_keys, function(gk) terra::rast(files[[gk]])))
-    r_mean  <- terra::app(stack_r, fun="mean", na.rm=TRUE)
-    if (agg_fact > 1) r_mean <- terra::aggregate(r_mean, fact=agg_fact, fun="mean")
-    list(raster=raster::raster(r_mean), fallback=TRUE, n_genus=length(genus_keys))
-  }, error=function(e) list(raster=NULL, fallback=TRUE))
+.cached_load <- function(cache_key, load_fn) {
+  # 1. In-memory hit
+  if (exists(cache_key, envir=.raster_cache))
+    return(get(cache_key, envir=.raster_cache))
+  # 2. Disk hit (projected .rds from a previous load this session)
+  rds_path <- file.path(.raster_cache_dir, paste0(cache_key, ".rds"))
+  if (file.exists(rds_path)) {
+    result <- readRDS(rds_path)
+    assign(cache_key, result, envir=.raster_cache)
+    return(result)
+  }
+  # 3. Cold load: read TIF, project, cache
+  result <- load_fn()
+  tryCatch(saveRDS(result, rds_path), error=function(e) NULL)
+  assign(cache_key, result, envir=.raster_cache)
+  result
 }
 
-all_gjam_keys <- unique(c(names(gjam_files[["2040_2069"]]), names(gjam_files[["2070_2099"]])))
-all_gjam_display <- sort(species_display[intersect(all_gjam_keys, names(species_display))])
+load_gjam_raster_for_key <- function(key, period) {
+  cache_key <- paste0("v2_future_", period, "_", key)
+  .cached_load(cache_key, function() {
+    files <- vis_gjam_files[[period]]
+    tryCatch({
+      if (key %in% names(files) && file.exists(files[[key]])) {
+        list(raster=.prep_raster(terra::rast(files[[key]])), fallback=FALSE)
+      } else {
+        genus_lower <- tolower(regmatches(key, regexpr("^[a-z]+", key)))
+        genus_keys  <- names(files)[startsWith(tolower(names(files)), genus_lower)]
+        genus_keys  <- genus_keys[vapply(genus_keys, function(gk) file.exists(files[[gk]]), logical(1))]
+        if (length(genus_keys) == 0) return(list(raster=NULL, fallback=TRUE))
+        stack_r <- terra::rast(lapply(genus_keys, function(gk) terra::rast(files[[gk]])))
+        r_mean  <- terra::app(stack_r, fun="mean", na.rm=TRUE)
+        list(raster=.prep_raster(r_mean), fallback=TRUE)
+      }
+    }, error=function(e) list(raster=NULL, fallback=TRUE))
+  })
+}
+
+load_hist_raster_for_key <- function(key) {
+  if (length(hist_files) == 0) return(list(raster=NULL, fallback=FALSE))
+  cache_key <- paste0("v2_hist_", key)
+  .cached_load(cache_key, function() {
+    tryCatch({
+      if (key %in% names(hist_files) && file.exists(hist_files[[key]])) {
+        list(raster=.prep_raster(terra::rast(hist_files[[key]])), fallback=FALSE)
+      } else {
+        genus_lower <- tolower(regmatches(key, regexpr("^[a-z]+", key)))
+        genus_keys  <- names(hist_files)[startsWith(tolower(names(hist_files)), genus_lower)]
+        genus_keys  <- genus_keys[vapply(genus_keys, function(gk) file.exists(hist_files[[gk]]), logical(1))]
+        if (length(genus_keys) == 0) return(list(raster=NULL, fallback=TRUE))
+        stack_r <- terra::rast(lapply(genus_keys, function(gk) terra::rast(hist_files[[gk]])))
+        r_mean  <- terra::app(stack_r, fun="mean", na.rm=TRUE)
+        list(raster=.prep_raster(r_mean), fallback=TRUE)
+      }
+    }, error=function(e) list(raster=NULL, fallback=TRUE))
+  })
+}
+
+all_vis_keys <- unique(c(
+  names(vis_gjam_files[["2040_2069"]]),
+  names(vis_gjam_files[["2070_2099"]]),
+  names(hist_files)
+))
+all_vis_display <- sort(species_display[intersect(all_vis_keys, names(species_display))])
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 app_css <- "
@@ -587,25 +689,26 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
   box-shadow: 0 1px 4px rgba(0,0,0,0.3);
 }
 
-/* ── GJAM tab ── */
-.gjam-outer { height: calc(100vh - 106px); display: flex; }
-.gjam-sidebar {
-  width: 230px; min-width: 230px;
+/* ── Visualizations tab ── */
+.vis-outer { height: calc(100vh - 106px); display: flex; }
+.vis-sidebar {
+  width: 260px; min-width: 260px;
   background: var(--cream);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
+  overflow: hidden;
 }
-.gjam-sidebar-header {
+.vis-sidebar-header {
   padding: 12px 12px 8px;
   border-bottom: 1px solid var(--border);
   background: var(--linen); flex-shrink: 0;
 }
-.gjam-sidebar-header h4 {
+.vis-sidebar-header h4 {
   font-family: var(--font);
   font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
   color: var(--mid); margin: 0 0 6px 0;
 }
-.gjam-search {
+.vis-search {
   width: 100%; padding: 7px 10px;
   font-family: var(--font); font-size: 11px;
   border: 1px solid var(--border);
@@ -613,29 +716,29 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
   border-radius: var(--radius-sm);
   outline: none; box-shadow: inset 0 1px 2px rgba(0,0,0,0.06);
 }
-.gjam-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(58,138,90,0.15); }
-.gjam-species-list { flex: 1; overflow-y: auto; padding: 4px 0; }
-.gjam-sp-item {
+.vis-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(58,138,90,0.15); }
+.vis-species-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+.vis-sp-item {
   padding: 8px 12px;
   font-family: var(--font); font-style: italic; font-size: 11px;
   color: var(--ink); cursor: pointer;
   border-bottom: 1px solid var(--linen);
   transition: background 0.1s;
 }
-.gjam-sp-item:hover { background: var(--linen); }
-.gjam-sp-item.active { background: var(--mid); color: white; }
+.vis-sp-item:hover { background: var(--linen); }
+.vis-sp-item.active { background: var(--mid); color: white; }
 
-.gjam-map-area { flex: 1; display: flex; flex-direction: column; }
-.gjam-topbar {
+.vis-map-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.vis-topbar {
   display: flex; align-items: center; gap: 14px; padding: 8px 14px; flex-shrink: 0;
   background: var(--linen); border-bottom: 1px solid var(--border);
 }
-.gjam-species-title {
+.vis-species-title {
   font-family: var(--font); font-style: italic; font-size: 13px;
   color: var(--ink); font-weight: 500; flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.gjam-fallback-note {
+.vis-fallback-note {
   font-family: var(--font); font-size: 9px; color: #92400E;
   background: #FEF3C7; padding: 3px 8px; border-radius: 10px;
   font-style: normal; flex-shrink: 0;
@@ -647,21 +750,73 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
   font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--ink2); white-space: nowrap;
 }
-.gjam-map-wrap { flex: 1; position: relative; }
-.gjam-map-wrap #gjam_map { height: 100%; width: 100%; }
-.gjam-legend {
+.vis-content { flex: 1; display: flex; min-height: 0; }
+.vis-map-wrap { flex: 1; position: relative; }
+.vis-map-wrap #vis_map { height: 100%; width: 100%; }
+
+/* ── Layer select panel (single-select) ── */
+.vis-layer-panel {
+  width: 180px; min-width: 180px;
+  background: var(--linen);
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.vis-layer-panel-header {
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--cream); flex-shrink: 0;
+}
+.vis-layer-panel-header h4 {
+  font-family: var(--font);
+  font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--mid); margin: 0;
+}
+.vis-layer-list {
+  flex: 1; padding: 10px 10px; display: flex; flex-direction: column; gap: 6px;
+}
+
+/* Single-select pill buttons */
+.vis-layer-btn {
+  display: flex; align-items: center;
+  padding: 9px 16px;
+  border-radius: 22px;
+  border: 1.5px solid var(--border);
+  background: white;
+  cursor: pointer; user-select: none;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+  box-shadow: var(--shadow);
+}
+.vis-layer-btn:hover {
+  background: var(--linen);
+  border-color: var(--sage);
+}
+.vis-layer-btn.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent-d));
+  border-color: var(--accent-d);
+  box-shadow: 0 2px 8px rgba(58,138,90,0.35);
+}
+.vis-layer-btn-label {
+  font-family: var(--font); font-size: 11px; font-weight: 500;
+  color: var(--ink); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: color 0.15s;
+}
+.vis-layer-btn.active .vis-layer-btn-label { color: white; font-weight: 600; }
+
+/* Vis map legend */
+.vis-legend {
   position: absolute; bottom: 12px; left: 12px; z-index: 1000;
-  background: rgba(247,249,246,0.96);
+  background: rgba(247,249,246,0.97);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 8px 12px; min-width: 140px;
+  padding: 10px 14px; min-width: 160px;
   pointer-events: none;
   box-shadow: var(--shadow);
 }
-.legend-title { font-family: var(--font); font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mid); display: block; margin-bottom: 5px; }
-.legend-gradient { height: 8px; width: 100%; border-radius: 4px; }
-.legend-labels { display: flex; justify-content: space-between; margin-top: 3px; }
-.legend-labels span { font-family: var(--font); font-size: 9px; color: var(--ink2); }
+.legend-title { font-family: var(--font); font-size: 9px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--mid); display: block; margin-bottom: 6px; }
+.legend-gradient { height: 10px; width: 100%; border-radius: 5px; }
+.legend-ticks { display: flex; justify-content: space-between; margin-top: 4px; }
+.legend-ticks span { font-family: var(--font); font-size: 9px; font-weight: 500; color: var(--ink2); }
 
 /* ── Decision-Making tab ── */
 .dm-outer { height: calc(100vh - 106px); display: flex; flex-direction: column; background: var(--linen); }
@@ -860,11 +1015,14 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
 .container-fluid { padding: 0 !important; }
 .row { margin: 0 !important; }
 .dm-species-scroll::-webkit-scrollbar,
-.gjam-species-list::-webkit-scrollbar { width: 4px; }
+.vis-species-list::-webkit-scrollbar,
+.vis-layer-list::-webkit-scrollbar { width: 4px; }
 .dm-species-scroll::-webkit-scrollbar-track,
-.gjam-species-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
+.vis-species-list::-webkit-scrollbar-track,
+.vis-layer-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
 .dm-species-scroll::-webkit-scrollbar-thumb,
-.gjam-species-list::-webkit-scrollbar-thumb { background: var(--sage); border-radius: 2px; }
+.vis-species-list::-webkit-scrollbar-thumb,
+.vis-layer-list::-webkit-scrollbar-thumb { background: var(--sage); border-radius: 2px; }
 
 .riparian-info {
   background: white; border-radius: var(--radius);
@@ -924,25 +1082,39 @@ ui <- fluidPage(
   tags$head(
     tags$style(HTML(app_css)),
     tags$script(HTML("
-$(document).on('click', '.dm-sp-row', function() {
-  $('.dm-sp-row').removeClass('selected'); $(this).addClass('selected');
-  Shiny.setInputValue('dm_selected_species', $(this).data('key'), {priority:'event'});
-});
+// ── Shared time-range toggle ──────────────────────────────────────────────────
 $(document).on('click', '.time-seg', function() {
   $('.time-seg').removeClass('active'); $(this).addClass('active');
   Shiny.setInputValue('time_range', $(this).data('val'), {priority:'event'});
 });
-$(document).on('click', '.gjam-sp-item', function() {
-  $('.gjam-sp-item').removeClass('active'); $(this).addClass('active');
-  Shiny.setInputValue('gjam_selected_species', $(this).data('key'), {priority:'event'});
+
+// ── Decision-Making species select ───────────────────────────────────────────
+$(document).on('click', '.dm-sp-row', function() {
+  $('.dm-sp-row').removeClass('selected'); $(this).addClass('selected');
+  Shiny.setInputValue('dm_selected_species', $(this).data('key'), {priority:'event'});
 });
-$(document).on('input', '#gjam_search', function() {
+
+// ── Visualizations species select ────────────────────────────────────────────
+$(document).on('click', '.vis-sp-item', function() {
+  $('.vis-sp-item').removeClass('active'); $(this).addClass('active');
+  Shiny.setInputValue('vis_selected_species', $(this).data('key'), {priority:'event'});
+});
+
+$(document).on('input', '#vis_search', function() {
   var q = $(this).val().toLowerCase();
-  $('.gjam-sp-item').each(function() {
-    var name = $(this).text().toLowerCase();
-    $(this).toggle(name.indexOf(q) >= 0);
+  $('.vis-sp-item').each(function() {
+    $(this).toggle($(this).text().toLowerCase().indexOf(q) >= 0);
   });
 });
+
+// ── Layer single-select ───────────────────────────────────────────────────────
+$(document).on('click', '.vis-layer-btn', function() {
+  $('.vis-layer-btn').removeClass('active');
+  $(this).addClass('active');
+  Shiny.setInputValue('vis_active_layer', $(this).data('layer'), {priority:'event'});
+});
+
+// ── Riparian slider label override ────────────────────────────────────────────
 var riparianLabels = ['Disregard', 'Tie-breaker', 'Required'];
 function relabelRiparianSlider() {
   $('#riparian_mode').closest('.riparian-group').find('.irs-single, .irs-from, .irs-to').each(function() {
@@ -954,10 +1126,10 @@ $(document).on('shiny:value', function() { setTimeout(relabelRiparianSlider, 50)
 $(document).on('input change', '#riparian_mode', function() { setTimeout(relabelRiparianSlider, 10); });
 
 $(document).ready(function() {
-  setTimeout(relabelRiparianSlider, 300);
   Shiny.setInputValue('time_range', '2040_2069', {priority:'event'});
+  Shiny.setInputValue('vis_active_layer', 'future_ba', {priority:'event'});
+  setTimeout(relabelRiparianSlider, 300);
 });
-
     "))
   ),
   
@@ -992,9 +1164,9 @@ $(document).ready(function() {
                            div(class="sidebar-col",
                                tags$span(class="sidebar-section-label", "Model Weights"),
                                div(class="weight-group",
-                                   div(class="weight-label", "GJAM Score"),
+                                   div(class="weight-label", "Predicted Future BA Score"),
                                    sliderInput("w1", NULL, min=0, max=1, value=0.34, step=0.01, ticks=FALSE, width="100%"),
-                                   div(class="weight-note", "Predicted BA from GJAM across US by given timeframe")
+                                   div(class="weight-note", "Predicted basal area from model across US by given timeframe")
                                ),
                                div(class="weight-group",
                                    div(class="weight-label", "Wildlife Value"),
@@ -1034,35 +1206,6 @@ $(document).ready(function() {
                                            leafletOutput("terrain_minimap", height="163px", width="185px")))
                                ),
                                uiOutput("coord_display")
-                           )
-                       )
-              ),
-              
-              tabPanel("GJAM",
-                       div(class="gjam-outer",
-                           div(class="gjam-sidebar",
-                               div(class="gjam-sidebar-header",
-                                   tags$h4("Species"),
-                                   tags$input(id="gjam_search", class="gjam-search",
-                                              type="text", placeholder="Filter species...")
-                               ),
-                               div(class="gjam-species-list", uiOutput("gjam_species_list_ui"))
-                           ),
-                           div(class="gjam-map-area",
-                               div(class="gjam-topbar",
-                                   uiOutput("gjam_species_title_ui"),
-                                   div(class="time-toggle-wrap",
-                                       div(class="time-toggle-label", "Period"),
-                                       div(class="time-toggle",
-                                           div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
-                                           div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
-                                       )
-                                   )
-                               ),
-                               div(class="gjam-map-wrap",
-                                   leafletOutput("gjam_map", height="100%", width="100%"),
-                                   div(class="gjam-legend", uiOutput("gjam_legend_ui"))
-                               )
                            )
                        )
               ),
@@ -1109,6 +1252,57 @@ $(document).ready(function() {
                        )
               ),
               
+              # ── Visualizations tab (formerly GJAM) ────────────────────────────────────
+              tabPanel("Visualizations",
+                       div(class="vis-outer",
+                           # Species list sidebar
+                           div(class="vis-sidebar",
+                               div(class="vis-sidebar-header",
+                                   tags$h4("Species"),
+                                   tags$input(id="vis_search", class="vis-search",
+                                              type="text", placeholder="Filter species...")
+                               ),
+                               div(class="vis-species-list", uiOutput("vis_species_list_ui"))
+                           ),
+                           # Map + layer panel
+                           div(class="vis-map-area",
+                               div(class="vis-topbar",
+                                   uiOutput("vis_species_title_ui"),
+                                   div(class="time-toggle-wrap",
+                                       div(class="time-toggle-label", "Period"),
+                                       div(class="time-toggle",
+                                           div(class="time-seg active", `data-val`="2040_2069", "2040–2069"),
+                                           div(class="time-seg",        `data-val`="2070_2099", "2070–2099")
+                                       )
+                                   )
+                               ),
+                               div(class="vis-content",
+                                   div(class="vis-map-wrap",
+                                       leafletOutput("vis_map", height="100%", width="100%"),
+                                       div(class="vis-legend", uiOutput("vis_legend_ui"))
+                                   ),
+                                   # Layer single-select panel
+                                   div(class="vis-layer-panel",
+                                       div(class="vis-layer-panel-header",
+                                           tags$h4("Layer")
+                                       ),
+                                       div(class="vis-layer-list",
+                                           div(class="vis-layer-btn active", `data-layer`="future_ba",
+                                               div(class="vis-layer-btn-label", "Predicted Future BA")
+                                           ),
+                                           div(class="vis-layer-btn", `data-layer`="hist_ba",
+                                               div(class="vis-layer-btn-label", "Historical BA")
+                                           ),
+                                           div(class="vis-layer-btn", `data-layer`="canopy",
+                                               div(class="vis-layer-btn-label", "CHM (all species)")
+                                           )
+                                       )
+                                   ) # end vis-layer-panel
+                               ) # end vis-content
+                           ) # end vis-map-area
+                       ) # end vis-outer
+              ), # end Visualizations tabPanel
+              
               tabPanel("About",
                        div(class="about-outer",
                            div(class="about-hero",
@@ -1125,7 +1319,7 @@ $(document).ready(function() {
                                        div(class="about-name", "Tate Commission"),
                                        div(class="about-role", "Lead Developer"),
                                        tags$p(class="about-bio",
-                                              "Tate Commission is a sophomore at Duke University studying Statistical Science. His interests include creaeting beautiful data visualizations, developing statistical simulations to understand complex systems, and building deep learning for satellite imagery analysis. He has extensive experience developing interactive tools for large-scale geospatial analysis through R and R Shiny. His work has supported projects with American Forests, NASA, and the African Parks Foundation including through the Qiu Lab at Duke University.")
+                                              "Tate Commission is a sophomore at Duke University studying Statistical Science. His interests include creating beautiful data visualizations, developing statistical simulations to understand complex systems, and building deep learning for satellite imagery analysis. He has extensive experience developing interactive tools for large-scale geospatial analysis through R and R Shiny. His work has supported projects with American Forests, NASA, and the African Parks Foundation including through the Qiu Lab at Duke University.")
                                    )
                                ),
                                div(class="about-person",
@@ -1143,24 +1337,26 @@ $(document).ready(function() {
                                        div(class="about-name", "Dr. James Clark"),
                                        div(class="about-role", "Faculty Advisor"),
                                        tags$p(class="about-bio",
-                                              "Dr. James Clark is the Nicholas Distinguished Professor of Environmental Science at Duke University and a Fellow of the Ecological Society of America. Clark’s lab uses using long-term experiments and monitoring studies to understand disturbance and climate controls on ecosystem dynamics. He has has authored more than 250 refereed scientific articles and published four books, and he pioneered of the GJAM framework that serves as the backbone of this application.")
+                                              "Dr. James Clark is the Nicholas Distinguished Professor of Environmental Science at Duke University and a Fellow of the Ecological Society of America. Clark's lab uses long-term experiments and monitoring studies to understand disturbance and climate controls on ecosystem dynamics. He has authored more than 250 refereed scientific articles and published four books, and he pioneered the framework that serves as the backbone of this application.")
                                    )
                                )
                            )
                        )
               )
-  )
+  ) # end tabsetPanel
 )
 
 server <- function(input, output, session) {
   
   rv <- reactiveValues(
-    click_lng     = NULL,
-    click_lat     = NULL,
-    time_range    = "2040_2069",
-    gjam_raster   = NULL,
-    gjam_fallback = FALSE,
-    usfs_region   = NULL
+    click_lng          = NULL,
+    click_lat          = NULL,
+    time_range         = "2040_2069",
+    # Visualizations tab — only the active raster is held in memory
+    vis_raster         = NULL,
+    vis_raster_range   = c(NA_real_, NA_real_),
+    vis_fallback       = FALSE,
+    usfs_region        = NULL
   )
   
   observeEvent(input$time_range, { rv$time_range <- input$time_range })
@@ -1250,8 +1446,8 @@ server <- function(input, output, session) {
     
     leafletProxy("main_map") %>% clearMarkers() %>%
       addMarkers(lng=lng, lat=lat, icon=thumbtack_icon)
-    leafletProxy("gjam_map") %>% clearMarkers() %>%
-      addMarkers(lng=lng, lat=lat, icon=thumbtack_icon)
+    leafletProxy("vis_map") %>% clearGroup("vis_pin") %>%
+      addMarkers(lng=lng, lat=lat, icon=thumbtack_icon, group="vis_pin")
     
     leafletProxy("sat_minimap") %>%
       setView(lng=lng, lat=lat, zoom=POPUP_ZOOM) %>% clearMarkers() %>%
@@ -1309,86 +1505,198 @@ server <- function(input, output, session) {
       setView(lng=-96, lat=38, zoom=POPUP_ZOOM)
   })
   
-  output$gjam_map <- renderLeaflet({
+  # ── Visualizations tab map ──────────────────────────────────────────────────
+  output$vis_map <- renderLeaflet({
     leaflet(options=leafletOptions(zoomControl=TRUE)) %>%
-      addProviderTiles("CartoDB.Positron", options=providerTileOptions(maxZoom=12)) %>%
-      addPolygons(data=state_sf, fillOpacity=0, color="#2D5A48", weight=0.8, opacity=0.65) %>%
+      addProviderTiles("CartoDB.Positron",
+                       options=providerTileOptions(maxZoom=18)) %>%
+      addPolygons(data=state_sf, fillOpacity=0, color="#2D5A48",
+                  weight=0.8, opacity=0.65) %>%
       setView(lng=-96, lat=38, zoom=4)
   })
   
-  output$gjam_species_list_ui <- renderUI({
-    keys_available <- names(all_gjam_display)
-    sel <- input$gjam_selected_species
-    tagList(lapply(seq_along(all_gjam_display), function(i) {
-      key <- keys_available[i]; nm <- all_gjam_display[i]
-      cls <- if (!is.null(sel) && sel == key) "gjam-sp-item active" else "gjam-sp-item"
+  output$vis_species_list_ui <- renderUI({
+    keys_available <- names(all_vis_display)
+    sel <- input$vis_selected_species
+    tagList(lapply(seq_along(all_vis_display), function(i) {
+      key <- keys_available[i]; nm <- all_vis_display[i]
+      cls <- if (!is.null(sel) && sel == key) "vis-sp-item active" else "vis-sp-item"
       div(class=cls, `data-key`=key, nm)
     }))
   })
   
-  output$gjam_species_title_ui <- renderUI({
-    key <- input$gjam_selected_species
-    if (is.null(key) || !key %in% names(species_display))
-      return(div(class="gjam-species-title",
+  output$vis_species_title_ui <- renderUI({
+    layer <- if (!is.null(input$vis_active_layer)) input$vis_active_layer else "future_ba"
+    key   <- input$vis_selected_species
+    if (layer == "canopy") {
+      return(div(class="vis-species-title",
                  style="font-style:normal;color:var(--ink2);font-size:11px;",
-                 "Select a species to view its predicted BA map"))
-    fb_note <- if (isTRUE(rv$gjam_fallback))
-      div(class="gjam-fallback-note", "\u00f8 genus average")
+                 "CHM (all species) — select a BA layer to filter by species"))
+    }
+    if (is.null(key) || !key %in% names(species_display))
+      return(div(class="vis-species-title",
+                 style="font-style:normal;color:var(--ink2);font-size:11px;",
+                 "Select a species to view its basal area maps"))
+    fb_note <- if (isTRUE(rv$vis_fallback))
+      div(class="vis-fallback-note", "\u00f8 genus average")
     else NULL
-    tagList(div(class="gjam-species-title", species_display[key]), fb_note)
+    tagList(div(class="vis-species-title", species_display[key]), fb_note)
   })
   
-  observeEvent(list(input$gjam_selected_species, input$time_range), {
-    key    <- input$gjam_selected_species
-    period <- if (!is.null(input$time_range)) input$time_range else "2040_2069"
-    if (is.null(key) || key == "") return()
-    result <- load_gjam_raster_for_key(key, period, agg_fact=3)
-    rv$gjam_raster  <- result$raster
-    rv$gjam_fallback <- isTRUE(result$fallback)
-  }, ignoreNULL=TRUE)
+  # CHM (canopy) layer: species-independent — render immediately when selected,
+  # regardless of whether a species has been picked.
+  observeEvent(input$vis_active_layer, {
+    layer <- input$vis_active_layer
+    if (!is.null(layer) && layer == "canopy") {
+      rv$vis_raster       <- NULL
+      rv$vis_fallback     <- FALSE
+      rv$vis_raster_range <- c(NA, NA)
+      # render_vis_layers is also called by the vis_active_layer observer below,
+      # but we trigger it here too to be explicit and immediate.
+      if (identical(input$main_tabs, "Visualizations"))
+        session$onFlushed(function() { render_vis_layers() }, once=TRUE)
+    }
+  }, ignoreNULL=TRUE, ignoreInit=FALSE)
   
-  render_gjam_layer <- function() {
-    lng    <- isolate(rv$click_lng)
-    lat    <- isolate(rv$click_lat)
-    raster <- isolate(rv$gjam_raster)
-    proxy  <- leafletProxy("gjam_map") %>% clearImages() %>% clearMarkers()
-    if (!is.null(lng)) proxy <- proxy %>% addMarkers(lng=lng, lat=lat, icon=thumbtack_icon)
-    if (!is.null(raster)) {
-      vals <- safe_vals(raster)
-      if (length(vals) > 0) {
-        rng <- range(vals)
-        pal <- colorNumeric(
-          palette  = c("#EEF4FB","#9DC9E8","#3182BD","#08519C","#08205A"),
-          domain   = rng, na.color = "transparent"
+  # BA layers: need a species key — only load when one is selected.
+  observeEvent(list(input$vis_selected_species, input$time_range, input$vis_active_layer), {
+    key    <- input$vis_selected_species
+    period <- if (!is.null(input$time_range)) input$time_range else "2040_2069"
+    layer  <- if (!is.null(input$vis_active_layer)) input$vis_active_layer else "future_ba"
+    
+    # Canopy needs no species — handled by its own observer above
+    if (layer == "canopy") return()
+    # BA layers DO need a species
+    if (is.null(key) || key == "") return()
+    
+    if (layer == "future_ba") {
+      result <- load_gjam_raster_for_key(key, period)
+      rv$vis_raster       <- result$raster
+      rv$vis_fallback     <- isTRUE(result$fallback)
+      rv$vis_raster_range <- if (!is.null(result$raster)) {
+        v <- safe_vals(result$raster); if (length(v)) range(v) else c(NA,NA)
+      } else c(NA, NA)
+    } else if (layer == "hist_ba") {
+      result <- load_hist_raster_for_key(key)
+      rv$vis_raster       <- result$raster
+      rv$vis_fallback     <- isTRUE(result$fallback)
+      rv$vis_raster_range <- if (!is.null(result$raster)) {
+        v <- safe_vals(result$raster); if (length(v)) range(v) else c(NA,NA)
+      } else c(NA, NA)
+    }
+  }, ignoreNULL=FALSE)
+  
+  # Orange gradient palette used for all raster BA layers
+  orange_pal <- function(rng) {
+    colorNumeric(
+      palette  = c("#FFF8EC","#FDDBA5","#F59E0B","#B45309","#7C2D12"),
+      domain   = rng,
+      na.color = "transparent"
+    )
+  }
+  
+  # ── Named layer IDs so we swap only the data layer, never the basemap ─────────
+  VIS_RASTER_ID <- "vis_ba_raster"
+  VIS_TILE_ID   <- "vis_canopy_tile"
+  # 32 MB budget lets leaflet render at full detail; it downsamples for the
+  # current viewport automatically, giving full detail at zoom and good
+  # continental coverage without manual aggregation.
+  VIS_MAX_BYTES <- 32L * 1024L * 1024L
+  
+  render_vis_layers <- function() {
+    layer <- isolate(input$vis_active_layer)
+    if (is.null(layer)) layer <- "future_ba"
+    
+    proxy <- leafletProxy("vis_map")
+    
+    # Remove only the previous data layer(s), never the basemap or polygons
+    proxy <- proxy %>%
+      removeImage(VIS_RASTER_ID) %>%
+      removeTiles(VIS_TILE_ID)
+    
+    # Re-add pin if needed (pin is in its own group, unaffected by above)
+    lng <- isolate(rv$click_lng)
+    lat <- isolate(rv$click_lat)
+    if (!is.null(lng)) {
+      proxy <- proxy %>%
+        clearGroup("vis_pin") %>%
+        addMarkers(lng=lng, lat=lat, icon=thumbtack_icon, group="vis_pin")
+    }
+    
+    if (layer %in% c("future_ba", "hist_ba")) {
+      r   <- isolate(rv$vis_raster)
+      rng <- isolate(rv$vis_raster_range)
+      if (!is.null(r) && !any(is.na(rng))) {
+        pal <- orange_pal(rng)
+        proxy <- proxy %>% addRasterImage(
+          r, colors=pal, opacity=0.78, project=TRUE,
+          layerId=VIS_RASTER_ID, maxBytes=VIS_MAX_BYTES
         )
-        proxy <- proxy %>% addRasterImage(raster, colors=pal, opacity=0.75, project=TRUE)
+      }
+    } else if (layer == "canopy") {
+      if (!is.null(canopy_tile_url) && nzchar(canopy_tile_url)) {
+        proxy <- proxy %>%
+          addTiles(
+            urlTemplate = canopy_tile_url,
+            layerId     = VIS_TILE_ID,
+            options     = tileOptions(opacity=0.78, maxZoom=18),
+            attribution = "Meta/WRI Canopy Height \u2022 GEE Community Catalog"
+          )
       }
     }
   }
   
   observeEvent(input$main_tabs, {
-    if (identical(input$main_tabs, "GJAM"))
-      session$onFlushed(function() { render_gjam_layer() }, once=TRUE)
+    if (identical(input$main_tabs, "Visualizations"))
+      session$onFlushed(function() { render_vis_layers() }, once=TRUE)
   })
-  observeEvent(rv$gjam_raster, {
-    if (identical(input$main_tabs, "GJAM")) render_gjam_layer()
+  
+  observeEvent(rv$vis_raster, {
+    if (identical(input$main_tabs, "Visualizations")) render_vis_layers()
+  }, ignoreNULL=FALSE)
+  
+  observeEvent(input$vis_active_layer, {
+    if (identical(input$main_tabs, "Visualizations"))
+      session$onFlushed(function() { render_vis_layers() }, once=TRUE)
   }, ignoreNULL=TRUE)
   
-  output$gjam_legend_ui <- renderUI({
-    r <- rv$gjam_raster
-    if (is.null(r)) return(NULL)
-    vals <- safe_vals(r); if (length(vals)==0) return(NULL)
-    rng <- range(vals)
+  # ── Legend: single layer, real numeric ticks ──────────────────────────────────
+  output$vis_legend_ui <- renderUI({
+    layer <- input$vis_active_layer
+    if (is.null(layer)) layer <- "future_ba"
+    
+    if (layer == "canopy") {
+      return(tagList(
+        tags$span(class="legend-title", "CHM — all species (m)"),
+        div(class="legend-gradient",
+            style="background:linear-gradient(to right,#0A1F0A,#2E6B2E,#7DB87D,#E8F4D0,#FFFFFF);"),
+        div(class="legend-ticks",
+            tags$span("0"), tags$span("7"), tags$span("15"), tags$span("22"), tags$span("30+"))
+      ))
+    }
+    
+    rng <- rv$vis_raster_range
+    if (is.null(rng) || any(is.na(rng))) return(NULL)
+    
+    title <- if (layer == "future_ba") "Predicted Future BA (m\u00b2/ha)"
+    else "Historical BA (m\u00b2/ha)"
+    
+    # 5 evenly-spaced tick values
+    ticks <- pretty(rng, n=4)
+    ticks <- ticks[ticks >= rng[1] & ticks <= rng[2]]
+    if (length(ticks) < 2) ticks <- round(c(rng[1], mean(rng), rng[2]), 2)
+    tick_labels <- formatC(ticks, format="f", digits=2)
+    
     tagList(
-      tags$span(class="legend-title", "Predicted basal area (transformed)"),
+      tags$span(class="legend-title", title),
       div(class="legend-gradient",
-          style="background:linear-gradient(to right,#EEF4FB,#9DC9E8,#3182BD,#08519C,#08205A);"),
-      div(class="legend-labels",
-          tags$span(round(rng[1],2)),
-          tags$span(round(rng[2],2)))
+          style="background:linear-gradient(to right,#FFF8EC,#FDDBA5,#F59E0B,#B45309,#7C2D12);"),
+      div(class="legend-ticks",
+          lapply(tick_labels, tags$span))
     )
   })
   
+  # ── Decision-Making tab ─────────────────────────────────────────────────────
   output$dm_loc_label <- renderUI({
     if (is.null(rv$click_lat))
       div(class="dm-loc-text", "No site selected — click the map on the Location tab.")
@@ -1453,7 +1761,7 @@ server <- function(input, output, session) {
                      div(class="dm-composite-val", "—")),
                  div(class="dm-component-row",
                      div(class="dm-comp-card gjam-card",
-                         tags$span(class="dm-comp-label","GJAM Predicted BA"),
+                         tags$span(class="dm-comp-label","Predicted Future BA"),
                          div(class="dm-comp-val","—")),
                      div(class="dm-comp-card wild-card",
                          tags$span(class="dm-comp-label","Wildlife Value"),
@@ -1477,7 +1785,7 @@ server <- function(input, output, session) {
     
     gjam_raw_note <- if (isTRUE(row$gjam_is_genus_avg[1])) {
       div(class="genus-avg-badge", "\u00f8 genus-level average")
-    } else div(class="dm-comp-raw", "direct GJAM prediction")
+    } else div(class="dm-comp-raw", "direct model prediction")
     
     div(class="dm-score-layout",
         div(class="dm-composite-card",
@@ -1487,7 +1795,7 @@ server <- function(input, output, session) {
         ),
         div(class="dm-component-row",
             div(class="dm-comp-card gjam-card",
-                tags$span(class="dm-comp-label", "GJAM Predicted BA"),
+                tags$span(class="dm-comp-label", "Predicted Future BA"),
                 div(class="dm-comp-val", fmt(row$gjam[1])),
                 gjam_raw_note
             ),
@@ -1533,7 +1841,7 @@ server <- function(input, output, session) {
     header <- div(style="display:flex;gap:12px;margin-bottom:8px;",
                   div(style="width:120px;flex-shrink:0;"),
                   div(style="flex:1;display:flex;gap:4px;",
-                      div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--gjam-c);text-align:center;","GJAM"),
+                      div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--gjam-c);text-align:center;","Pred. BA"),
                       div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--wild-c);text-align:center;","Wildlife"),
                       div(style="flex:1;font-family:var(--font);font-size:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;color:var(--timb-c);text-align:center;","Timber")
                   )
