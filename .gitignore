@@ -1,0 +1,17 @@
+.DS_Store
+.Rapp.history
+*.rdata
+*.RData
+*.tif
+*.gpkg
+*.rds
+rsconnect/
+*.jpg
+*.png
+www/
+prototype/BA_wildlife_traits.csv
+prototype/timber_price_by_gjam_species_wide.csv
+.Rproj.user
+gee-key.json
+rsconnect/
+.Rproj.user/
