@@ -309,7 +309,11 @@ ba4_title <- function(yr, scen) {
 # Draw only what is on screen: crop the single-species map to the current view (plus a
 # margin), keep native 1 km unless that would be more than BA4_MAX_CELLS cells (whole-US
 # view), then project to Web Mercator once with terra (fast) for leaflet.
-BA4_MAX_CELLS <- 1.5e6
+# Two detail levels only: native 1 km whenever the cropped view has at most BA4_MAX_CELLS cells
+# (about a 17-degree-wide view), otherwise 4 km. Only the most zoomed-out views (most of the US
+# on screen) use the cached whole-US 4 km image; the 8 km base image is just a stand-in while the
+# detailed image redraws. Raise BA4_MAX_CELLS to keep 1 km over a wider view (slower to draw).
+BA4_MAX_CELLS <- 4e6
 .ba4_rng <- new.env(hash = TRUE, parent = emptyenv())
 # Bounded cache for the large in-memory rasters (whole-US copies, predictor maps): keeps the
 # 24 most recently used and drops the oldest, so memory stays flat however long you browse.
@@ -329,18 +333,35 @@ ba4_cache_get <- function(key) {
   if (!exists(key, envir = .ba4_rng, inherits = FALSE)) return(NULL)
   val <- get(key, envir = .ba4_rng); ba4_cache_put(key, val); val
 }
+.ba4_cov <- new.env(parent = emptyenv())   # lon/lat outline of the area the last crop covers (NULL = everything)
 ba4_view_raster <- function(r, b) {
+  .ba4_cov$poly <- NULL
   e <- terra::ext(r)
   if (!is.null(b) && all(c("north", "south", "east", "west") %in% names(b))) {
-    dx <- (b$east - b$west) * 0.25; dy <- (b$north - b$south) * 0.25
-    g  <- expand.grid(x = seq(max(b$west - dx, -179), min(b$east + dx, 179), length.out = 15),
-                      y = seq(max(b$south - dy, -85), min(b$north + dy, 85), length.out = 15))
+    dx <- (b$east - b$west) * 0.2; dy <- (b$north - b$south) * 0.2
+    # Clamp the view to a box around the US before projecting it into the raster's CRS. Zoomed far
+    # out, the view reaches well beyond the US, and projecting those far-away points (e.g. into an
+    # equal-area CRS) gives a bad extent, which cropped the map to a partial piece of the country.
+    x0 <- max(b$west - dx, -135); x1 <- min(b$east + dx, -55)
+    y0 <- max(b$south - dy, 15);  y1 <- min(b$north + dy, 60)
+    if (x0 >= x1 || y0 >= y1) return(NULL)
+    g  <- expand.grid(x = seq(x0, x1, length.out = 15), y = seq(y0, y1, length.out = 15))
     pts <- terra::project(terra::vect(as.matrix(g), crs = "EPSG:4326"), terra::crs(r))
+    .ba4_cov$poly <- tryCatch({                       # outline of this crop, so the page can check it covers the view
+      ce <- terra::ext(pts)
+      xs <- seq(terra::xmin(ce), terra::xmax(ce), length.out = 12)
+      ys <- seq(terra::ymin(ce), terra::ymax(ce), length.out = 12)
+      ring <- rbind(cbind(xs, ys[1]), cbind(xs[12], ys[-1]), cbind(rev(xs)[-1], ys[12]), cbind(xs[1], rev(ys)[-1]))
+      ll <- terra::crds(terra::project(terra::vect(ring, crs = terra::crs(r)), "EPSG:4326"))
+      list(lon = unname(ll[, 1]), lat = unname(ll[, 2]))
+    }, error = function(err) NULL)
     e   <- tryCatch(terra::intersect(terra::ext(pts), terra::ext(r)), error = function(err) NULL)
     if (is.null(e) || terra::xmin(e) >= terra::xmax(e) || terra::ymin(e) >= terra::ymax(e)) return(NULL)
   }
   full_area <- (terra::xmax(r) - terra::xmin(r)) * (terra::ymax(r) - terra::ymin(r))
   if ((terra::xmax(e) - terra::xmin(e)) * (terra::ymax(e) - terra::ymin(e)) > 0.6 * full_area) {
+    .ba4_cov$poly <- NULL                              # whole map drawn: everything is covered
+    assign("last_fct", 4L, envir = .ba4_rng)
     ck <- paste0("coarse_", terra::sources(r)[1])
     hit <- ba4_cache_get(ck)
     if (!is.null(hit)) return(hit)
@@ -350,7 +371,7 @@ ba4_view_raster <- function(r, b) {
     return(out)
   }
   rc  <- terra::crop(r, e)
-  fct <- max(1L, ceiling(sqrt(terra::ncell(rc) / BA4_MAX_CELLS)))
+  fct <- if (terra::ncell(rc) <= BA4_MAX_CELLS) 1L else 4L   # only two detail levels: 1 km or 4 km
   assign("last_fct", fct, envir = .ba4_rng)
   if (fct > 1L) rc <- terra::aggregate(rc, fact = fct, fun = "mean", na.rm = TRUE)
   raster::raster(terra::project(rc, "EPSG:3857", method = "bilinear"))
@@ -400,6 +421,20 @@ pred_common_range <- function(var) {
     stats::quantile(x, c(0.01, 0.99), names = FALSE)
   }))
   v <- c(min(q[, 1]), max(q[, 2])); assign(ck, v, envir = .ba4_rng); v
+}
+# Un-clamped value of a predictor map at a point, in the layer's display units (°F, in, ...)
+pred_value_at <- function(layer, yr, scen, lng, lat) {
+  info <- PRED_INFO[[layer]]
+  f <- if (isTRUE(info$static)) file.path(.pred_dir, paste0("static_", info$var, ".tif"))
+  else file.path(.pred_dir, paste0(info$var, "_", pred_tag(yr, scen), ".tif"))
+  if (!file.exists(f)) return(NA_real_)
+  tryCatch({
+    r  <- terra::rast(f)
+    pt <- terra::project(terra::vect(matrix(c(lng, lat), ncol = 2), crs = "EPSG:4326"), terra::crs(r))
+    v  <- as.numeric(terra::extract(r, pt)[1, -1])
+    if (!is.finite(v) || v < -9000) return(NA_real_)
+    signif(if (is.function(info$conv)) info$conv(v) else v, 4)
+  }, error = function(e) NA_real_)
 }
 load_pred_raster <- function(layer, yr, scen) {
   info <- PRED_INFO[[layer]]
@@ -707,11 +742,18 @@ load_ba4_raster <- function(key, yr, scen) {
 }
 
 all_vis_keys <- ba4_keys   # maps only for the species the model fitted
+# If modeled_species.csv (one column of species codes = the 100 GJAM species) sits next to app.R,
+# only those species are shown in Visualizations, whatever other map files exist.
+if (file.exists("modeled_species.csv")) {
+  .ms <- tryCatch(as.character(utils::read.csv("modeled_species.csv", stringsAsFactors = FALSE)[[1]]),
+                  error = function(e) NULL)
+  if (length(.ms)) all_vis_keys <- intersect(ba4_keys, .ms)
+}
 
 # After a species is drawn, quietly prepare its other period/scenario maps one at a time while
 # the app is idle (reads the file into the disk cache and builds the whole-US copy), so
 # switching period or scenario feels instant. A new selection cancels any unfinished preparation.
-.ba4_pf <- new.env(parent = emptyenv()); .ba4_pf$gen <- 0L
+.ba4_pf <- new.env(parent = emptyenv()); .ba4_pf$gen <- 0L; .ba4_pf$busy <- 0
 ba4_prefetch <- function(key, yr, scen) {
   .ba4_pf$gen <- .ba4_pf$gen + 1L; gen <- .ba4_pf$gen
   yr <- as.character(yr)
@@ -721,6 +763,9 @@ ba4_prefetch <- function(key, yr, scen) {
   cb <- cb[order((cb$yr != yr) + (cb$scen != scen)), , drop = FALSE]
   step <- function(i) {
     if (i > nrow(cb) || !identical(.ba4_pf$gen, gen)) return(invisible())
+    if (as.numeric(Sys.time()) < .ba4_pf$busy) {            # user is panning/zooming: let the map redraw first
+      later::later(function() step(i), 1); return(invisible())
+    }
     f <- ba4_path(key, cb$yr[i], cb$scen[i])
     if (file.exists(f)) tryCatch({
       invisible(readBin(f, "raw", file.size(f)))
@@ -958,10 +1003,70 @@ function(el, x, data) {
   LeafletWidget.methods.visWipe = function(on) { setWipe(Array.isArray(on) ? on[0] === true : on === true); };
   console.log('wipe ready');
 
-  setTimeout(function() {
+  // Tell R the current view after every pan / zoom / resize, so the BA image is always redrawn to cover it
+  function sendView(need) {
+    if (!window.Shiny || !Shiny.setInputValue) return;
+    var sz = map.getSize(); if (!sz.x || !sz.y) return;   // map hidden
+    var b = map.getBounds();
+    Shiny.setInputValue('vis_view', {north: b.getNorth(), south: b.getSouth(), east: b.getEast(),
+                                     west: b.getWest(), zoom: map.getZoom(), need: need === true, t: Date.now()}, {priority: 'event'});
+  }
+
+  // The drawn image must always cover the view. R says what the image covers; if the view is not
+  // inside it (whatever the reason), ask R to redraw for exactly this view.
+  var cover = null, needKey = '', needT = 0;
+  function inPoly(x, y, P) {
+    var c = false, n = P.lon.length;
+    for (var i = 0, j = n - 1; i < n; j = i++) {
+      if (((P.lat[i] > y) !== (P.lat[j] > y)) &&
+          (x < (P.lon[j] - P.lon[i]) * (y - P.lat[i]) / (P.lat[j] - P.lat[i]) + P.lon[i])) c = !c;
+    }
+    return c;
+  }
+  function viewCovered() {
+    if (!cover || cover.lon.length < 4) return true;       // whole map drawn
+    var b = map.getBounds();
+    var w = Math.max(b.getWest(), -135), e = Math.min(b.getEast(), -55);
+    var s = Math.max(b.getSouth(), 15),  n = Math.min(b.getNorth(), 60);
+    if (w >= e || s >= n) return true;
+    var xs = [w, (w + e) / 2, e], ys = [s, (s + n) / 2, n];
+    for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++) if (!inPoly(xs[i], ys[j], cover)) return false;
+    return true;
+  }
+  function checkCover() {
+    var sz = map.getSize(); if (!sz.x || !sz.y) return;
+    if (viewCovered()) return;
+    var b = map.getBounds();
+    var key = [b.getWest().toFixed(3), b.getSouth().toFixed(3), b.getEast().toFixed(3), b.getNorth().toFixed(3)].join(',');
+    if (key === needKey && Date.now() - needT < 5000) return;   // already asked for this view
+    needKey = key; needT = Date.now();
+    sendView(true);
+  }
+  LeafletWidget.methods.visCover = function(lon, lat) {
+    lon = [].concat(lon || []); lat = [].concat(lat || []);
+    cover = lon.length > 3 ? {lon: lon, lat: lat} : null;
+    setTimeout(checkCover, 300);
+  };
+  map.on('moveend', checkCover);
+  map.on('moveend', sendView);
+  map.on('resize', function() { setTimeout(sendView, 150); });
+
+  // Start on the whole state of Pennsylvania. The map can be hidden (zero size) when the page loads,
+  // so fit as soon as it has a size, once.
+  var fittedPA = false;
+  function fitPA() {
+    if (fittedPA) return;
+    var sz = map.getSize(); if (!sz.x || !sz.y) return;
+    fittedPA = true;
     map.invalidateSize();
     map.fitBounds([[data.south, data.west], [data.north, data.east]], {padding: [20, 20]});
-  }, 250);
+  }
+  setTimeout(fitPA, 250);
+  if (window.ResizeObserver) {
+    new ResizeObserver(function() { setTimeout(fitPA, 100); }).observe(el);
+  } else {
+    var tries = 0, iv = setInterval(function() { fitPA(); if (fittedPA || ++tries > 60) clearInterval(iv); }, 500);
+  }
 }
 )---"
 
@@ -1516,6 +1621,8 @@ body { font-family: var(--font); background: var(--forest); color: var(--ink); m
   color: var(--ink); flex: 1;
 }
 .dm-loc-text { font-family: var(--font); font-size: 10px; color: var(--ink2); }
+.dm-export-btn { font-family: var(--font); font-size: 10px; font-weight: 500; padding: 4px 10px; border-radius: var(--radius-sm); background: var(--white); color: var(--ink); border: 1px solid var(--border); }
+.dm-export-btn:hover { background: var(--linen); color: var(--ink); }
 .dm-time-controls { display: flex; align-items: center; gap: 10px; }
 
 .dm-main { flex: 1; display: flex; min-height: 0; overflow: hidden; }
@@ -1949,7 +2056,8 @@ tabsetPanel(id="main_tabs",
                              div(class="dm-time-controls",
                                  ba4_selector()
                              ),
-                             uiOutput("dm_region_label")
+                             uiOutput("dm_region_label"),
+                             downloadButton("dm_export_csv", "Export spreadsheet", class="dm-export-btn")
                          ),
                          div(class="dm-main",
                              div(class="dm-left",
@@ -2186,11 +2294,11 @@ server <- function(input, output, session) {
   # Scores the given species at the selected site. `ref` (optional) holds the values of the
   # species already scored at the site (list(gjam=, timber=)), so a single extra species is
   # normalised against the same best-at-site values instead of changing the ranking.
-  build_scores <- function(keys, ref = NULL) {
+  build_scores <- function(keys, ref = NULL, yr = NULL, sc = NULL) {   # yr / sc: score for a given period and scenario (default: the selected ones)
     site <- current_site()
     
-    yr_sel <- if (!is.null(input$vis_year)) as.character(input$vis_year) else "2060"
-    sc_sel <- if (!is.null(input$vis_scen)) input$vis_scen else "ssp245"
+    yr_sel <- if (!is.null(yr)) as.character(yr) else if (!is.null(input$vis_year)) as.character(input$vis_year) else "2060"
+    sc_sel <- if (!is.null(sc)) sc else if (!is.null(input$vis_scen)) input$vis_scen else "ssp245"
     gjam_result        <- get_gjam_vals_v4(site, keys, yr_sel, sc_sel)
     gjam_raw           <- gjam_result$values * BA_M2HA_TO_FT2AC   # predicted BA, ft2/acre
     gjam_n             <- norm_site(c(gjam_raw, ref$gjam))[seq_along(gjam_raw)]   # / best species at the site
@@ -2453,7 +2561,7 @@ server <- function(input, output, session) {
   
   # ── Visualizations tab map ──────────────────────────────────────────────────
   output$vis_map <- renderLeaflet({
-    leaflet(options=leafletOptions(zoomControl=TRUE)) %>%
+    leaflet(options=leafletOptions(zoomControl=TRUE, minZoom=3)) %>%
       addProviderTiles("OpenStreetMap.Mapnik", options=providerTileOptions(maxZoom=19, className="dark-base")) %>%
       addPolygons(data=state_sf, fillOpacity=0, color="#9FB8AA",
                   weight=0.8, opacity=0.5) %>%
@@ -2463,11 +2571,22 @@ server <- function(input, output, session) {
   })
   
   # ── Species list respects Ranked / All scope ───────────────────────────────
+  # Ranking for the Visualizations tab: scored among the directly modeled species only, so genus
+  # averages never enter it. (The Decision-Making scores are unchanged.)
+  vis_ranked_scored <- reactive({
+    site <- current_site()
+    if (is.null(site)) return(NULL)
+    all_sp <- tryCatch(get_all_species(site), error = function(e) NULL)
+    keys <- if (is.null(all_sp)) character(0) else intersect(all_sp$key, all_vis_keys)
+    if (length(keys) == 0) return(NULL)
+    apply_riparian_mode(build_scores(keys), input$riparian_mode)
+  })
+  
   output$vis_species_list_ui <- renderUI({
     scope     <- if (is.null(input$vis_species_scope)) "ranked" else input$vis_species_scope
     sel       <- input$vis_selected_species
-    ranked_df <- composite_scores()                 # only the directly modeled species have maps
-    if (!is.null(ranked_df)) ranked_df <- head(ranked_df[ranked_df$key %in% ba4_keys, , drop = FALSE], 10)
+    ranked_df <- vis_ranked_scored()                # directly modeled species only
+    if (!is.null(ranked_df)) ranked_df <- head(ranked_df, 10)
     q         <- trimws(if (is.null(input$vis_search_text)) "" else input$vis_search_text)
     
     # Searching lists every matching species, whichever scope is selected
@@ -2574,23 +2693,40 @@ server <- function(input, output, session) {
   VIS_RASTER_ID <- "vis_ba_raster"
   VIS_LEFT_ID   <- "vis_ba_left"
   VIS_TILE_ID   <- "vis_canopy_tile"
-  VIS_MAX_BYTES <- 32L * 1024L * 1024L
+  VIS_MAX_BYTES <- 64L * 1024L * 1024L
   ba4_last      <- new.env()   # view the BA image was last drawn for
   set_wipe <- function(on) leaflet::invokeMethod(leafletProxy("vis_map"), NULL, "visWipe", on)
-  draw_ba_overlay <- function() {
+  # Latest view of the Visualizations map (sent by the map itself after every pan/zoom)
+  cur_view <- function() {
+    v <- isolate(input$vis_view)
+    if (!is.null(v) && all(c("north", "south", "east", "west") %in% names(v)))
+      return(list(north = v$north, south = v$south, east = v$east, west = v$west))
+    isolate(input$vis_map_bounds)
+  }
+  # Tell the page what area the drawn image covers; if the view is not inside it, the page asks again
+  send_cover <- function() {
+    cv <- ba4_last$cover
+    leaflet::invokeMethod(leafletProxy("vis_map"), NULL, "visCover",
+                          if (is.null(cv)) numeric(0) else cv$lon, if (is.null(cv)) numeric(0) else cv$lat)
+  }
+  draw_ba_overlay <- function(b = NULL) {
     r   <- isolate(rv$vis_raster)
     rng <- isolate(rv$vis_raster_range)
     if (is.null(r) || any(is.na(rng))) return(invisible())
-    b    <- isolate(input$vis_map_bounds)
+    if (is.null(b)) b <- cur_view()
     clip <- tryCatch(ba4_view_raster(r, b),
                      error = function(e) { message("BA draw failed: ", conditionMessage(e)); NULL })
+    if (is.null(clip)) { ba4_last$b <- NULL; return(invisible()) }
     ba4_last$b <- b
-    if (is.null(clip)) return(invisible())
+    ba4_last$cover <- .ba4_cov$poly                       # outline of this crop (NULL = whole map)
     if (rng[2] <= rng[1]) rng[2] <- rng[1] + 1e-6
     pal <- ba4_clamped_pal(orange_pal(rng), rng)
-    leafletProxy("vis_map") %>% addRasterImage(
-      clip, colors = pal, opacity = 0.78, project = FALSE,
-      layerId = VIS_RASTER_ID, maxBytes = VIS_MAX_BYTES)   # same id = replaces the old image
+    tryCatch(
+      leafletProxy("vis_map") %>% addRasterImage(
+        clip, colors = pal, opacity = 0.78, project = FALSE,
+        layerId = VIS_RASTER_ID, maxBytes = VIS_MAX_BYTES),   # same id = replaces the old image
+      error = function(e) message("BA draw failed: ", conditionMessage(e)))
+    vis_prog(0.55)
     
     # Left side of the divider: the map for the "Left side" period (same species, scenario and colours)
     key <- isolate(input$vis_selected_species)
@@ -2609,16 +2745,68 @@ server <- function(input, output, session) {
         layerId = VIS_LEFT_ID, maxBytes = VIS_MAX_BYTES)
       set_wipe(TRUE)
     }
+    vis_prog(0.85)
+    send_cover()
     invisible()
   }
   
-  # Changing the left-side period redraws the left image
   observeEvent(input$vis_year_left, {
-    if (identical(input$main_tabs, "Visualizations") && isTRUE(input$vis_active_layer %in% "future_ba"))
+    if (identical(input$main_tabs, "Visualizations") && isTRUE(input$vis_active_layer %in% "future_ba")) {
       draw_ba_overlay()
+    }
   }, ignoreInit = TRUE)
   
+  # Pin placed on the Visualizations map only (the main site pin is not changed). Until the user
+  # clicks this map, the pin is the main site; choosing a new main site resets it.
+  vis_pin <- reactiveValues(lng = NULL, lat = NULL)
+  vis_pin_loc <- reactive({
+    if (!is.null(vis_pin$lng)) c(vis_pin$lng, vis_pin$lat)
+    else if (!is.null(rv$click_lng)) c(rv$click_lng, rv$click_lat)
+    else NULL
+  })
+  draw_vis_pin <- function() {
+    proxy <- leafletProxy("vis_map") %>% clearGroup("vis_pin")
+    if (!is.null(isolate(vis_pin$lng))) {
+      proxy %>% addMarkers(lng=isolate(vis_pin$lng), lat=isolate(vis_pin$lat),
+                           icon=thumbtack_icon, group="vis_pin")
+    } else if (!is.null(isolate(rv$click_lng))) {
+      if (identical(isolate(rv$geom_type), "polygon") && !is.null(isolate(rv$poly_lng))) {
+        proxy %>% addPolygons(lng=isolate(rv$poly_lng), lat=isolate(rv$poly_lat), group="vis_pin",
+                              color="#FF5050", weight=2.5, opacity=1,
+                              fillColor="#FF5050", fillOpacity=0.15)
+      } else {
+        proxy %>% addMarkers(lng=isolate(rv$click_lng), lat=isolate(rv$click_lat),
+                             icon=thumbtack_icon, group="vis_pin")
+      }
+    }
+    invisible()
+  }
+  observeEvent(input$vis_map_click, {
+    cl  <- input$vis_map_click
+    lng <- ((cl$lng + 180) %% 360) - 180; lat <- cl$lat
+    if (lat < 24 || lat > 50 || lng < -125 || lng > -66) return()
+    vis_pin$lng <- lng; vis_pin$lat <- lat
+    draw_vis_pin()
+  })
+  observeEvent(list(rv$click_lng, rv$click_lat), {      # new main site -> back to the main pin
+    vis_pin$lng <- NULL; vis_pin$lat <- NULL
+  }, ignoreNULL = FALSE, ignoreInit = TRUE)
+  
+  # Loading bar (same style as the spreadsheet export)
+  with_loading <- function(expr, message = "Loading map")
+    withProgress(message = message, value = 0.15, session = session, expr)
+  vis_prog <- function(v) tryCatch(setProgress(v, session = session), error = function(e) NULL)
+  
+  # Several things can ask for a redraw at once (tab shown, layer button, new raster); do it once
+  .vis_rp <- new.env(); .vis_rp$done <- as.numeric(Sys.time()) - 100
+  request_vis_render <- function() {
+    session$onFlushed(function() {
+      if (as.numeric(Sys.time()) - .vis_rp$done > 1) render_vis_layers()   # skip if one just ran
+    }, once = TRUE)
+  }
+  
   render_vis_layers <- function() {
+    on.exit(.vis_rp$done <- as.numeric(Sys.time()), add = TRUE)
     layer <- isolate(input$vis_active_layer)
     if (is.null(layer)) layer <- "future_ba"
     
@@ -2629,35 +2817,22 @@ server <- function(input, output, session) {
       removeImage(VIS_RASTER_ID) %>% removeImage(VIS_LEFT_ID) %>%
       removeTiles(VIS_TILE_ID)
     
-    # Re-draw the selected site (pin or polygon) on this map
-    lng <- isolate(rv$click_lng)
-    lat <- isolate(rv$click_lat)
-    if (!is.null(lng)) {
-      proxy <- proxy %>% clearGroup("vis_pin")
-      if (identical(isolate(rv$geom_type), "polygon") && !is.null(isolate(rv$poly_lng))) {
-        proxy <- proxy %>%
-          addPolygons(lng=isolate(rv$poly_lng), lat=isolate(rv$poly_lat), group="vis_pin",
-                      color="#FF5050", weight=2.5, opacity=1,
-                      fillColor="#FF5050", fillOpacity=0.15)
-      } else {
-        proxy <- proxy %>%
-          addMarkers(lng=lng, lat=lat, icon=thumbtack_icon, group="vis_pin")
-      }
-    }
+    # Re-draw the pin on this map (the Visualizations pin if one was placed, else the selected site)
+    draw_vis_pin()
     
     if (layer == "future_ba") {
       r   <- isolate(rv$vis_raster)
       rng <- isolate(rv$vis_raster_range)
-      if (!is.null(r) && !any(is.na(rng))) draw_ba_overlay()
+      if (!is.null(r) && !any(is.na(rng))) with_loading(draw_ba_overlay())
     } else if (layer %in% names(PRED_INFO)) {
       r   <- isolate(rv$vis_raster)
       rng <- isolate(rv$vis_raster_range)
       if (!is.null(r) && !any(is.na(rng))) {
         if (rng[2] <= rng[1]) rng[2] <- rng[1] + 1e-6
         pal <- ba4_clamped_pal(colorNumeric(PRED_INFO[[layer]]$cols, domain = rng, na.color = "transparent"), rng)   # tiny float overshoot after reprojection is clamped
-        proxy <- proxy %>% addRasterImage(
+        with_loading(proxy <- proxy %>% addRasterImage(
           r, colors = pal, opacity = 0.85, project = FALSE,
-          layerId = VIS_RASTER_ID, maxBytes = VIS_MAX_BYTES)
+          layerId = VIS_RASTER_ID, maxBytes = VIS_MAX_BYTES))
       }
     } else if (layer == "canopy") {
       if (!is.null(canopy_tile_url) && nzchar(canopy_tile_url)) {
@@ -2673,8 +2848,7 @@ server <- function(input, output, session) {
   }
   
   observeEvent(input$main_tabs, {
-    if (identical(input$main_tabs, "Visualizations"))
-      session$onFlushed(function() { render_vis_layers() }, once=TRUE)
+    if (identical(input$main_tabs, "Visualizations")) request_vis_render()
   })
   
   observeEvent(rv$vis_raster, {
@@ -2682,34 +2856,38 @@ server <- function(input, output, session) {
   }, ignoreNULL=FALSE)
   
   observeEvent(input$vis_active_layer, {
-    if (identical(input$main_tabs, "Visualizations"))
-      session$onFlushed(function() { render_vis_layers() }, once=TRUE)
+    if (identical(input$main_tabs, "Visualizations")) request_vis_render()
   }, ignoreNULL=TRUE)
   
   # Redraw the BA image when the user pans/zooms outside what was drawn
-  vis_bounds_d <- debounce(reactive(input$vis_map_bounds), 400)
-  observeEvent(vis_bounds_d(), {
+  vis_view_d <- debounce(reactive(input$vis_view), 250)
+  observeEvent(vis_view_d(), {
     if (!identical(input$main_tabs, "Visualizations")) return()
     if (!isTRUE(input$vis_active_layer %in% "future_ba")) return()
     if (is.null(rv$vis_raster)) return()
-    b <- vis_bounds_d(); lb <- ba4_last$b
-    if (!is.null(b) && !is.null(lb)) {
+    .ba4_pf$busy <- as.numeric(Sys.time()) + 4
+    v <- vis_view_d()
+    b <- list(north = v$north, south = v$south, east = v$east, west = v$west)
+    lb <- ba4_last$b
+    redraw <- TRUE
+    if (!isTRUE(v$need) && !is.null(lb)) {
       w  <- b$east - b$west; lw <- lb$east - lb$west
-      pw <- lw * 0.25;       ph <- (lb$north - lb$south) * 0.25
+      pw <- lw * 0.2;        ph <- (lb$north - lb$south) * 0.2
       inside <- b$west >= lb$west - pw && b$east <= lb$east + pw &&
         b$south >= lb$south - ph && b$north <= lb$north + ph
-      if (inside && w <= lw * 1.001 && w >= lw * 0.7) return()
+      redraw <- !(inside && w <= lw * 1.001 && w >= lw * 0.7)
     }
-    draw_ba_overlay()
+    if (redraw) draw_ba_overlay(b)
   }, ignoreNULL = TRUE)
   
   # Value of the layer on screen at the pin (polygon: its centroid), in the layer's own units
   vis_pin_value <- reactive({
-    r <- rv$vis_raster
-    if (is.null(r) || is.null(rv$click_lng)) return(NA_real_)
+    r   <- rv$vis_raster
+    loc <- vis_pin_loc()
+    if (is.null(r) || is.null(loc)) return(NA_real_)
     tryCatch({
       rr <- if (inherits(r, "SpatRaster")) r else terra::rast(r)
-      pt <- terra::project(terra::vect(matrix(c(rv$click_lng, rv$click_lat), ncol = 2), crs = "EPSG:4326"),
+      pt <- terra::project(terra::vect(matrix(loc, ncol = 2), crs = "EPSG:4326"),
                            terra::crs(rr))
       as.numeric(terra::extract(rr, pt)[1, -1])
     }, error = function(e) NA_real_)
@@ -2723,6 +2901,14 @@ server <- function(input, output, session) {
       div(style = sprintf("position:absolute;left:%.1f%%;bottom:100%%;transform:translateX(-%.1f%%);margin-bottom:5px;font-family:var(--font);font-size:9px;font-weight:600;color:#E03C3C;white-space:nowrap;", p, p), label),
       div(style = sprintf("position:absolute;left:%.1f%%;bottom:100%%;margin-left:-4px;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid #E03C3C;", p))
     )
+  }
+  
+  # One-line note under the legend: where the Visualizations pin is
+  vis_pin_note <- function() {
+    loc <- vis_pin_loc()
+    if (is.null(loc)) return(div(style="font-family:var(--font);font-size:9px;color:var(--ink2);margin-top:6px;", "Click the map to place a pin"))
+    div(style="font-family:var(--font);font-size:9px;color:var(--ink2);margin-top:6px;",
+        sprintf("Pin %.3f\u00b0N  %.3f\u00b0W \u00b7 click the map to move it", loc[2], abs(loc[1])))
   }
   
   # ── Legend ────────────────────────────────────────────────────────────────────
@@ -2755,7 +2941,8 @@ server <- function(input, output, session) {
             legend_marker(pv, rng, pv_lb),
             div(class="legend-gradient",
                 style=paste0("background:linear-gradient(to right,", paste(PRED_INFO[[layer]]$cols, collapse=","), ");"))),
-        div(class="legend-ticks", lapply(formatC(ticks, format="g", digits=3), tags$span))
+        div(class="legend-ticks", lapply(formatC(ticks, format="g", digits=3), tags$span)),
+        vis_pin_note()
       ))
     }
     
@@ -2774,7 +2961,8 @@ server <- function(input, output, session) {
           div(class="legend-gradient",
               style="background:linear-gradient(to right,#0B3B2E,#17803D,#2FD16B,#B8F25A,#FFF07A);")),
       div(class="legend-ticks",
-          lapply(tick_labels, tags$span))
+          lapply(tick_labels, tags$span)),
+      vis_pin_note()
     )
   })
   
@@ -2789,6 +2977,92 @@ server <- function(input, output, session) {
     else
       div(class="dm-loc-text", sprintf("%.4f\u00b0N  %.4f\u00b0W", rv$click_lat, abs(rv$click_lng)))
   })
+  
+  # Spreadsheet for the selected site: every species in the model, for every period x scenario
+  # (2000 baseline, 2060 and 2090 under SSP245 and SSP585), with the environmental variables.
+  # Written as .xlsx (several sheets) when the writexl or openxlsx package is installed, else as .csv.
+  xlsx_pkg <- function() {
+    if (requireNamespace("writexl", quietly = TRUE)) "writexl"
+    else if (requireNamespace("openxlsx", quietly = TRUE)) "openxlsx"
+    else NA_character_
+  }
+  output$dm_export_csv <- downloadHandler(
+    filename = function() {
+      ext <- if (is.na(xlsx_pkg())) "csv" else "xlsx"
+      if (is.null(rv$click_lng)) paste0("pbgjam_site.", ext)
+      else sprintf("pbgjam_site_%.4f_%.4f.%s", rv$click_lat, rv$click_lng, ext)
+    },
+    content = function(file) {
+      req(rv$click_lng)
+      keys <- species_names                      # every species in the model
+      combos <- data.frame(yr = c("2000", "2060", "2060", "2090", "2090"),
+                           sc = c("ssp245", "ssp245", "ssp585", "ssp245", "ssp585"),
+                           stringsAsFactors = FALSE)
+      combos$label <- ifelse(combos$yr == "2000", "2000_baseline", paste0(combos$yr, "_", combos$sc))
+      
+      res <- withProgress(message = "Building spreadsheet", value = 0, {
+        lapply(seq_len(nrow(combos)), function(i) {
+          incProgress(1 / nrow(combos), detail = combos$label[i])
+          build_scores(keys, yr = combos$yr[i], sc = combos$sc[i])   # all species, best first
+        })
+      })
+      
+      # one row per species; BA (ft2/acre), score and rank for each combination
+      d1 <- res[[1]]; m1 <- match(keys, d1$key)
+      species_tbl <- data.frame(species = d1$display_name[m1],
+                                ba_source = ifelse(d1$gjam_is_genus_avg[m1], "genus average", "modeled"),
+                                timber_price_usd_per_mbf = d1$timber_raw[m1],
+                                stringsAsFactors = FALSE)
+      for (i in seq_along(res)) {
+        d <- res[[i]]; m <- match(keys, d$key)
+        rk <- seq_len(nrow(d)); rk[is.na(d$score)] <- NA
+        lab <- combos$label[i]
+        species_tbl[[paste0("ba_ft2_acre_", lab)]] <- round(d$gjam_raw[m], 2)
+        species_tbl[[paste0("score_", lab)]]       <- round(d$score[m], 4)
+        species_tbl[[paste0("rank_", lab)]]        <- rk[m]
+      }
+      cur <- which(combos$yr == as.character(input$vis_year) & combos$sc == input$vis_scen)
+      cur <- if (length(cur)) cur[1] else 2
+      species_tbl <- species_tbl[order(species_tbl[[paste0("rank_", combos$label[cur])]], na.last = TRUE), , drop = FALSE]
+      
+      # best 10 and worst 10 for each combination
+      bw <- do.call(rbind, lapply(seq_along(res), function(i) {
+        d <- res[[i]]; d <- d[!is.na(d$score), , drop = FALSE]; d$rank <- seq_len(nrow(d))
+        pick <- function(x, grp) if (nrow(x)) data.frame(combination = combos$label[i], group = grp, rank = x$rank,
+                                                         species = x$display_name, score = round(x$score, 4),
+                                                         stringsAsFactors = FALSE) else NULL
+        rbind(pick(head(d, 10), "best"), pick(tail(d, min(10, nrow(d))), "worst"))
+      }))
+      
+      # environmental variables at the site, one column per combination
+      vlab <- c(pred_wintmin = "winter_min_temp_F", pred_precip = "annual_precip_in",
+                pred_cec = "soil_cec_cmolc_per_kg", pred_sand = "soil_sand_pct",
+                pred_north = "slope_north_south_index", pred_east = "slope_east_west_index")
+      vars <- data.frame(variable = unname(vlab[names(PRED_INFO)]), stringsAsFactors = FALSE)
+      for (i in seq_len(nrow(combos)))
+        vars[[combos$label[i]]] <- vapply(names(PRED_INFO), function(l)
+          pred_value_at(l, combos$yr[i], combos$sc[i], rv$click_lng, rv$click_lat), numeric(1))
+      
+      site_tbl <- data.frame(latitude = round(rv$click_lat, 5), longitude = round(rv$click_lng, 5),
+                             usfs_region = if (is.null(rv$usfs_region)) NA_character_ else rv$usfs_region,
+                             pa_timber_region = get_pa_timber_region(rv$click_lng, rv$click_lat))
+      
+      sheets <- list(site = site_tbl, variables = vars, species = species_tbl, best_worst = bw)
+      pkg <- xlsx_pkg()
+      if (identical(pkg, "writexl")) {
+        writexl::write_xlsx(sheets, file)
+      } else if (identical(pkg, "openxlsx")) {
+        openxlsx::write.xlsx(sheets, file)
+      } else {                                   # no spreadsheet package: the same tables in one csv
+        con <- file(file, open = "w"); on.exit(close(con), add = TRUE)
+        for (nm in names(sheets)) {
+          writeLines(nm, con)
+          utils::write.csv(sheets[[nm]], con, row.names = FALSE, na = "")
+          writeLines("", con)
+        }
+      }
+    }
+  )
   
   output$dm_region_label <- renderUI({
     pa_reg <- if (!is.null(rv$click_lng)) get_pa_timber_region(rv$click_lng, rv$click_lat) else NA_character_
