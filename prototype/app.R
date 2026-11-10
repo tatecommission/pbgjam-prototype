@@ -151,7 +151,16 @@ species_display <- setNames(
 # ── maps_v4: 1 km basal-area maps (Model 2) — Visualizations tab only ───────────
 # One single-band GeoTIFF per species per year/scenario, made once by prep_maps_v4.R
 # from the 5 big files in maps_v4/. These maps drive the map view AND the species ranking.
-.ba4_dir <- path.expand("~/Documents/PBGJAM-data-explorer/maps_v4/by_species")
+# Where the map files live. Looks (in order) at: the PBGJAM_MAPS environment variable, a maps_v4 folder
+# next to app.R (the self-contained layout), then the original ~/Documents/PBGJAM-data-explorer/maps_v4.
+.maps_root <- local({
+  cands <- c(Sys.getenv("PBGJAM_MAPS", unset = ""), "maps_v4",
+             path.expand("~/Documents/PBGJAM-data-explorer/maps_v4"))
+  cands <- cands[nzchar(cands)]
+  hit   <- cands[dir.exists(cands)]
+  if (length(hit)) normalizePath(hit[1]) else cands[length(cands)]
+})
+.ba4_dir <- file.path(.maps_root, "by_species")
 ba4_path <- function(key, yr, scen) {
   yr <- as.character(yr)
   tag <- if (identical(yr, "2000")) "baseline_2000" else paste0(scen, "_", yr)
@@ -380,7 +389,7 @@ ba4_view_raster <- function(r, b) {
 # ── Predictor maps (4 km, made once by prep_predictors.R) ──────────────────────────
 # Climate: same window rule as the model; winTmin = coldest value in the window, annualPrec =
 # mean over the window; one shared colour range per variable. Soil / topography are static.
-.pred_dir <- path.expand("~/Documents/PBGJAM-data-explorer/maps_v4/predictors")
+.pred_dir <- file.path(.maps_root, "predictors")
 PRED_INFO <- list(
   pred_wintmin = list(var = "winTmin", static = FALSE,
                       title = "Winter minimum temperature (°F)",
@@ -655,10 +664,24 @@ weighted_composite_n <- function(vals, wts, active) {
   list(score = score, n_components = n_components)
 }
 
-options(tigris_use_cache=TRUE)
-state_sf <- tigris::states(cb=TRUE, resolution="500k", progress_bar=FALSE)
-state_sf <- state_sf[!state_sf$STUSPS %in% c("AK","HI","PR","VI","GU","MP","AS","DC"),]
-state_sf <- sf::st_transform(state_sf, 4326)
+# US state boundaries. Read from us_states.rds (works offline). If that file is missing, download once
+# (needs internet) and save it so later runs are offline. Make the file ahead of time with 0_download_offline_data.R.
+state_sf <- local({
+  f <- "us_states.rds"
+  x <- if (file.exists(f)) tryCatch(readRDS(f), error = function(e) NULL) else NULL
+  if (is.null(x)) {
+    options(tigris_use_cache = TRUE)
+    x <- tryCatch({
+      st <- tigris::states(cb = TRUE, resolution = "500k", progress_bar = FALSE)
+      st <- st[!st$STUSPS %in% c("AK","HI","PR","VI","GU","MP","AS","DC"), ]
+      sf::st_transform(st, 4326)
+    }, error = function(e)
+      stop("us_states.rds is missing and there is no internet to download it. ",
+           "Run 0_download_offline_data.R once while online (see instructions)."))
+    tryCatch(saveRDS(x, f), error = function(e) NULL)
+  }
+  x[!x$STUSPS %in% c("AK","HI","PR","VI","GU","MP","AS","DC"), ]
+})
 
 # ── Pennsylvania view (all maps open fitted to PA) ─────────────────────────────
 # Bounds come from the state polygons already loaded above, not hard-coded values.
@@ -789,7 +812,7 @@ main_map_js <- r"---(
 function(el, x, data) {
   var map = this;
   var inBounds = function(lat, lng) { return !(lat < 24 || lat > 50 || lng < -125 || lng > -66); };
-  var outMsg = '<span style="font-family:Lexend,sans-serif;font-size:12px;color:#555;">Select a location within the contiguous United States.</span>';
+  var outMsg = '<span style="font-family:'Avenir Next',Avenir,'Century Gothic','Segoe UI',Verdana,sans-serif;font-size:12px;color:#555;">Select a location within the contiguous United States.</span>';
 
   L.control.zoom({position: 'bottomright'}).addTo(map);
 
@@ -1072,7 +1095,6 @@ function(el, x, data) {
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 app_css <- "
-@import url('https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap');
 
 :root {
   --forest:   #1C3A28;
@@ -1098,7 +1120,7 @@ app_css <- "
   --radius-sm:6px;
   --shadow:   0 2px 8px rgba(0,0,0,0.10), 0 1px 2px rgba(0,0,0,0.06);
   --shadow-lg:0 8px 24px rgba(0,0,0,0.14), 0 2px 6px rgba(0,0,0,0.08);
-  --font: 'Lexend', sans-serif;
+  --font: 'Avenir Next', 'Avenir', 'Century Gothic', 'Segoe UI', Verdana, sans-serif;
 }
 
 * { box-sizing: border-box; }
